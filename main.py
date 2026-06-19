@@ -300,57 +300,83 @@ def score_capture(target, needed_to_send, T, player, timelines, my_planets,
     if remaining <= 5:
         return -1.0
 
-    time_penalty = 1.0 + T / 40.0
-    base = (target.production ** 1.3 * remaining) / (needed_to_send * time_penalty + 1.0)
-
     tl = timelines.get(target.id, [])
-    if tl:
-        t_idx = min(T, len(tl) - 1)
-        if tl[t_idx].owner not in (-1, player):
-            base *= 2.2
+    if not tl: return -1.0
+
+    t_idx = min(T, len(tl) - 1)
+    target_state = tl[t_idx]
+
+    # If it's already ours in the simulation, ROI is low unless we're reinforcing
+    if target_state.owner == player: return 0.1
+
+    time_penalty = 1.0 + T / 30.0
+    # Prioritize higher production and planets that will be owned longer
+    base = (target.production ** 1.5 * remaining) / (needed_to_send * time_penalty + 5.0)
+
+    # SNIPE OPTIMIZATION: Boost score if the planet just changed hands or is about to
+    # Check if there's heavy combat predicted at the target just before we arrive
+    combat_nearby = False
+    for dt in range(-2, 1):
+        check_t = t_idx + dt
+        if 1 <= check_t < len(tl):
+            if tl[check_t].owner != tl[max(0, check_t-1)].owner:
+                combat_nearby = True
+                break
+
+    if combat_nearby:
+        base *= 2.5  # Significant boost for sniping opportunities
+
+    if tl[t_idx].owner not in (-1, player):
+        base *= 1.8  # Boost for taking from enemies vs neutrals
 
     if is_static_planet(target, initial_by_id):
         base *= 1.4
 
     if my_planets:
         mn = min(dist(target.x, target.y, p.x, p.y) for p in my_planets)
-        if mn < 25.0:
-            base *= 1.25
-        elif mn < 40.0:
-            base *= 1.1
+        if mn < 20.0: base *= 1.3
+        elif mn < 40.0: base *= 1.1
 
     if target.id in comet_ids_set:
         life = get_comet_life(target.id, comets)
         usable = life - T
-        if usable < 5:
-            return -1.0
-        base *= min(1.0, usable / 40.0)
+        if usable < 10: return -1.0
+        base *= min(1.0, usable / 50.0)
 
     return base
 
 def plan_multi_source(target, T_est, needed_total, my_planets, available_ships,
                       initial_by_id, angular_velocity, comets, current_step):
-    contributors = []
-    total = 0
-    for src in sorted(my_planets, key=lambda p: dist(p.x, p.y, target.x, target.y)):
-        surplus = available_ships.get(src.id, 0)
-        if surplus <= 2:
-            continue
-        for t_try in [T_est, T_est + 1, T_est - 1]:
-            if t_try < 1:
-                continue
-            res = find_ships_for_arrival_turn(src, target, t_try, initial_by_id,
+    # Coordination optimization: Try to find a single arrival turn that most planets can hit
+    best_plan = None
+    max_total = 0
+
+    # Check a window around T_est to find the best synchronization turn
+    for sync_t in range(max(1, T_est - 5), T_est + 10):
+        current_plan = []
+        current_total = 0
+        for src in sorted(my_planets, key=lambda p: dist(p.x, p.y, target.x, target.y)):
+            surplus = available_ships.get(src.id, 0)
+            if surplus <= 2: continue
+
+            res = find_ships_for_arrival_turn(src, target, sync_t, initial_by_id,
                                               angular_velocity, comets, current_step, surplus)
-            if res is None:
-                continue
-            angle, s_min = res
-            send = max(s_min, min(surplus, needed_total - total + 3))
-            contributors.append((src, angle, send, t_try))
-            total += send
-            break
-        if total >= needed_total:
-            return contributors
-    return None
+            if res:
+                angle, s_min = res
+                # Send enough to help but don't over-commit if not needed
+                s_send = max(s_min, min(surplus, needed_total - current_total + 2))
+                current_plan.append((src, angle, s_send, sync_t))
+                current_total += s_send
+                if current_total >= needed_total: break
+
+        if current_total >= needed_total:
+            # Found a viable plan for this sync_t
+            return current_plan
+        elif current_total > max_total:
+            max_total = current_total
+            best_plan = current_plan
+
+    return best_plan if max_total >= needed_total * 0.8 else None
 
 def get_obs_val(obs, key, default):
     if isinstance(obs, dict):
@@ -460,7 +486,8 @@ def agent(obs):
 
     # ==========================================================
     # ==========================================================
-    # PHASE 2: Emergency defense (Multi-source)
+    # ==========================================================
+    # PHASE 2: Emergency defense (Stable Multi-source)
     # ==========================================================
     threatened = {}
     for p in my_planets:
@@ -470,7 +497,8 @@ def agent(obs):
                 threatened[p.id] = t
                 break
 
-    for target_id, t_fall in sorted(threatened.items(), key=lambda x: x[1]):
+    # Sort threatened planets by turn of fall, then by production (save high value first)
+    for target_id, t_fall in sorted(threatened.items(), key=lambda x: (x[1], -planet_by_id[x[0]].production)):
         target_p = planet_by_id[target_id]
         candidates = sorted(
             [src for src in my_planets if src.id != target_id and available_ships[src.id] > 0],
@@ -485,36 +513,45 @@ def agent(obs):
         defended = False
         for src in candidates:
             surplus = available_ships[src.id]
-            res = find_intercept_angle_and_time(src, target_p, initial_by_id, angular_vel,
-                                                comets, _current_step, surplus, horizon)
-            if res:
-                angle, T = res
-                if T <= t_fall:
-                    pending_defense_moves.append((src.id, angle, surplus, T))
-                    temp_extra_arrivals[target_id].append((T, player, surplus))
+            # Try to arrive exactly on time or slightly before
+            # Optimization: Try multiple arrival times to see if it helps against waves
+            best_res = None
+            for arr_offset in range(0, 3):
+                arr_t = t_fall - arr_offset
+                if arr_t < 1: continue
+                res = find_ships_for_arrival_turn(src, target_p, arr_t, initial_by_id,
+                                                  angular_vel, comets, _current_step, surplus)
+                if res:
+                    best_res = (res[0], arr_t, res[1])
+                    break
 
-                    test_tl = simulate_timelines(
-                        [target_p], fleet_arrival_map, initial_by_id, angular_vel,
-                        comets, _current_step, comet_ids_set,
-                        horizon=t_fall + 2, extra_arrivals=temp_extra_arrivals
+            if best_res:
+                angle, T, s_send = best_res
+                pending_defense_moves.append((src.id, angle, s_send, T))
+                temp_extra_arrivals[target_id].append((T, player, s_send))
+
+                test_tl = simulate_timelines(
+                    [target_p], fleet_arrival_map, initial_by_id, angular_vel,
+                    comets, _current_step, comet_ids_set,
+                    horizon=horizon, extra_arrivals=temp_extra_arrivals
+                )
+                # Stability check: ensure it stays ours for the whole predicted timeline
+                tl_target = test_tl[target_id]
+                if all(tl_target[tx].owner == player for tx in range(t_fall, len(tl_target))):
+                    # Defended! Commit moves.
+                    for s_id, ang, s_count, t_arr in pending_defense_moves:
+                        moves.append([s_id, ang, s_count])
+                        available_ships[s_id] -= s_count
+                        global_extra_arrivals[target_id].append((t_arr, player, s_count))
+                    timelines = simulate_timelines(
+                        planets, fleet_arrival_map, initial_by_id, angular_vel, comets,
+                        _current_step, comet_ids_set, horizon=horizon,
+                        extra_arrivals=global_extra_arrivals
                     )
-                    t_check = min(t_fall, len(test_tl[target_id]) - 1)
-                    if test_tl[target_id][t_check].owner == player:
-                        # Defended! Commit moves.
-                        for s_id, ang, s_count, t_arr in pending_defense_moves:
-                            moves.append([s_id, ang, s_count])
-                            available_ships[s_id] -= s_count
-                            global_extra_arrivals[target_id].append((t_arr, player, s_count))
-                        timelines = simulate_timelines(
-                            planets, fleet_arrival_map, initial_by_id, angular_vel, comets,
-                            _current_step, comet_ids_set, horizon=horizon,
-                            extra_arrivals=global_extra_arrivals
-                        )
-                        defended = True
-                        break
+                    defended = True
+                    break
         if defended:
             continue
-
     # PHASE 3: Tactical snipe
     # ==========================================================
     my_total_prod    = sum(p.production for p in my_planets)
