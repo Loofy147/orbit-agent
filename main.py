@@ -83,7 +83,7 @@ def safe_angle_and_distance(sx, sy, sr, tx, ty, tr):
     # Start fleet just outside source radius
     lx = sx + (sr + 0.1) * (dx / d)
     ly = sy + (sr + 0.1) * (dy / d)
-    if segment_hits_sun(lx, ly, tx, ty):
+    if segment_hits_sun(lx, ly, tx, ty, sun_radius_sq=132.25):
         return None
     return angle, max(0.0, d - (sr + 0.1) - tr)
 
@@ -231,8 +231,8 @@ def find_fleet_target_and_arrival(fleet, planets, initial_by_id, angular_velocit
         else: min_y, max_y = fny, fy
 
         # Sun collision (radius 10, center 50,50). Bounding box check first.
-        if min_x < 60.0 and max_x > 40.0 and min_y < 60.0 and max_y > 40.0:
-             if point_to_segment_dist_sq(50.0, 50.0, fx, fy, fnx, fny) < 100.0:
+        if min_x < 61.0 and max_x > 39.0 and min_y < 61.0 and max_y > 39.0:
+             if point_to_segment_dist_sq(50.0, 50.0, fx, fy, fnx, fny) < 110.25:
                  return None, None
 
         for p_id, p_obj, p_r, r_sq in p_data:
@@ -375,7 +375,7 @@ def score_capture(target, needed_to_send, T, player, timelines, my_planets,
 
     time_penalty = 1.0 + T / 30.0
     # Prioritize higher production and planets that will be owned longer
-    base = (target.production ** 1.5 * remaining) / (needed_to_send * time_penalty + 5.0)
+    base = (target.production ** 2.2 * remaining) / (needed_to_send * time_penalty + 5.0)
 
     # SNIPE OPTIMIZATION: Boost score if the planet just changed hands or is about to
     # Check if there's heavy combat predicted at the target just before we arrive
@@ -391,10 +391,10 @@ def score_capture(target, needed_to_send, T, player, timelines, my_planets,
         base *= 2.5  # Significant boost for sniping opportunities
 
     if tl[t_idx].owner not in (-1, player):
-        base *= 1.8  # Boost for taking from enemies vs neutrals
+        base *= 2.2  # Boost for taking from enemies vs neutrals
 
     if is_static_planet(target, initial_by_id):
-        base *= 1.4
+        base *= 1.6
 
     if my_planets:
         mn = min(dist(target.x, target.y, p.x, p.y) for p in my_planets)
@@ -416,7 +416,7 @@ def plan_multi_source(target, T_est, needed_total, my_planets, available_ships,
     max_total = 0
 
     # Check a window around T_est to find the best synchronization turn
-    for sync_t in range(max(1, T_est - 5), T_est + 10):
+    for sync_t in range(max(1, T_est - 8), T_est + 15):
         current_plan = []
         current_total = 0
         for src in sorted(my_planets, key=lambda p: dist(p.x, p.y, target.x, target.y)):
@@ -428,7 +428,7 @@ def plan_multi_source(target, T_est, needed_total, my_planets, available_ships,
             if res:
                 angle, s_min = res
                 # Send enough to help but don't over-commit if not needed
-                s_send = max(s_min, min(surplus, needed_total - current_total + 2))
+                s_send = s_min # Precision timing is better than overkill
                 current_plan.append((src, angle, s_send, sync_t))
                 current_total += s_send
                 if current_total >= needed_total: break
@@ -635,7 +635,7 @@ def agent(obs):
     # PHASE 3: Tactical snipe
     # ==========================================================
     my_total_prod    = sum(p.production for p in my_planets)
-    snipe_threshold  = max(15, int(my_total_prod * 2.0))
+    snipe_threshold  = max(25, int(my_total_prod * 4.0))
 
     for p in planets:
         if p.owner == player:
@@ -670,41 +670,41 @@ def agent(obs):
                     break
 
     # ==========================================================
+    # ==========================================================
     # PHASE 4: ROI-driven single-source captures
     # ==========================================================
     candidates = []
     for src in my_planets:
         surplus = available_ships[src.id]
-        if surplus <= 3:
-            continue
+        if surplus <= 3: continue
         for target in planets:
-            if target.id == src.id:
-                continue
+            if target.id == src.id: continue
+            # Initial estimate using 75% of surplus as a mid-range speed
             res = find_intercept_angle_and_time(src, target, initial_by_id, angular_vel,
-                                                comets, _current_step, surplus, horizon)
-            if res is None:
-                continue
+                                                comets, _current_step, max(1, int(surplus*0.75)), horizon)
+            if res is None: continue
             angle, T = res
-            if _current_step + T >= 495:
-                continue
+            if _current_step + T >= 495: continue
 
-            tl    = timelines.get(target.id, [])
+            tl = timelines.get(target.id, [])
+            if not tl: continue
             t_idx = min(T, len(tl) - 1)
-            if not tl or tl[t_idx].owner == player:
-                continue
+            if tl[t_idx].owner == player: continue
 
-            needed_at   = tl[t_idx].ships + 1
-            overhead    = 1.15 if game_phase == "early" else 1.10
+            needed_at = tl[t_idx].ships + 1
+            overhead = 1.15 if game_phase == "early" else 1.10
             needed_send = int(needed_at * overhead) + 2
-            if needed_send > surplus:
-                continue
+            if needed_send > surplus: continue
 
-            sc = score_capture(target, needed_send, T, player, timelines, my_planets,
-                               _current_step, comet_ids_set, comets, initial_by_id)
-            if sc > 0:
-                candidates.append((sc, src.id, target.id, angle, needed_send, T))
-
-    candidates.sort(key=lambda x: x[0], reverse=True)
+            # Re-verify intercept with the actual needed_send count (speed might change)
+            res2 = find_intercept_angle_and_time(src, target, initial_by_id, angular_vel,
+                                                 comets, _current_step, needed_send, horizon)
+            if res2:
+                angle2, T2 = res2
+                sc = score_capture(target, needed_send, T2, player, timelines, my_planets,
+                                   _current_step, comet_ids_set, comets, initial_by_id)
+                if sc > 0:
+                    candidates.append((sc, src.id, target.id, angle2, needed_send, T2))
     committed_targets = set()
 
     for sc, src_id, target_id, angle, needed, T in candidates:
