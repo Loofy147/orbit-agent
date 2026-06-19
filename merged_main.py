@@ -60,7 +60,7 @@ class ProducerLiteConfig:
     max_offensive_targets: int = 12
     max_defensive_targets: int = 6
     max_waves_per_turn: int = 6
-    roi_threshold: float = 1.25
+    roi_threshold: float = 1.35
     min_ships_to_launch: float = 4.0
     reinforce_size_beta: float = 2.2
     reinforce_eta_free: float = 3.0
@@ -90,13 +90,13 @@ class ProducerLiteConfig:
     prod_rush_top_k: int = 3
     prod_rush_roi_discount: float = 0.80
     # Comet hunting
-    comet_score_multiplier: float = 2.5
+    comet_score_multiplier: float = 2.0
     comet_movement_threshold: float = 0.5
     # ---- NEW: Nearest/Furthest wave split ----
     near_wave_fraction: float = 0.65   # fraction of W waves allocated to nearest targets
     # ---- NEW: Shrinking ring conquest ----
     enable_ring_conquest: bool = True
-    ring_inner_boost: float = 2.5      # score multiplier for targets inside conquest ring
+    ring_inner_boost: float = 2.0      # score multiplier for targets inside conquest ring
     ring_outer_penalty: float = 0.4    # score multiplier for targets outside ring
     ring_min_radius_frac: float = 0.15 # ring never shrinks below this fraction of map radius
     # ---- NEW: KNN source selection ----
@@ -1197,3 +1197,26 @@ def agent(obs):
     with torch.no_grad():
         sparse_row = _RUNTIME.tensor_action(obs_tensors)
     return sparse_action_row_to_moves(sparse_row, obs, player_id=player_id)
+
+import shutil, subprocess, sys, tarfile, tempfile
+from pathlib import Path
+
+WORK = Path("/kaggle/working")
+MAIN = WORK / "main.py"
+ARCHIVE = WORK / "submission.tar.gz"
+
+EXPECTED_ORBIT_LITE = {
+    "__init__.py", "adapter.py", "aiming.py", "constants.py", "distance_cache.py",
+    "garrison_launch.py", "geometry.py", "intercept_aim.py", "movement.py",
+    "movement_aiming.py", "movement_step.py", "obs.py", "planner_core.py",
+}
+EXPECTED_MEMBERS = {"main.py"} | {f"orbit_lite/{name}" for name in EXPECTED_ORBIT_LITE}
+
+def py_files(d: Path) -> set:
+    return {p.name for p in d.glob("*.py")}
+
+if not MAIN.is_file():
+    print("=" * 72)
+    print("ERROR: /kaggle/working/main.py does not exist.")
+    print()
+    print("This cell only PACKAGES main.py - it does not create it. Run the")
