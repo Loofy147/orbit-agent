@@ -459,7 +459,8 @@ def agent(obs):
             break
 
     # ==========================================================
-    # PHASE 2: Emergency defense
+    # ==========================================================
+    # PHASE 2: Emergency defense (Multi-source)
     # ==========================================================
     threatened = {}
     for p in my_planets:
@@ -471,46 +472,49 @@ def agent(obs):
 
     for target_id, t_fall in sorted(threatened.items(), key=lambda x: x[1]):
         target_p = planet_by_id[target_id]
-        defended  = False
         candidates = sorted(
-            [(src, available_ships[src.id], dist(src.x, src.y, target_p.x, target_p.y))
-             for src in my_planets if src.id != target_id and available_ships[src.id] > 0],
-            key=lambda x: x[2]
+            [src for src in my_planets if src.id != target_id and available_ships[src.id] > 0],
+            key=lambda s: dist(s.x, s.y, target_p.x, target_p.y)
         )
-        for src, surplus, _ in candidates:
-            for arr_t in [t_fall - 1, t_fall]:
-                if arr_t < 1: 
-                    continue
-                res = find_ships_for_arrival_turn(src, target_p, arr_t, initial_by_id,
-                                                  angular_vel, comets, _CURRENT_STEP, surplus)
-                if res is None: 
-                    continue
-                angle, s_needed = res
-                test_extra = defaultdict(list)
-                for k, v in global_extra_arrivals.items():
-                    test_extra[k] = list(v)
-                test_extra[target_id].append((arr_t, player, s_needed))
-                test_tl = simulate_timelines(
-                    [target_p], fleet_arrival_map, initial_by_id, angular_vel,
-                    comets, _CURRENT_STEP, comet_ids_set,
-                    horizon=t_fall + 2, extra_arrivals=test_extra
-                )
-                t_check = min(t_fall, len(test_tl[target_id]) - 1)
-                if test_tl[target_id][t_check].owner == player:
-                    moves.append([src.id, angle, s_needed])
-                    available_ships[src.id] -= s_needed
-                    global_extra_arrivals[target_id].append((arr_t, player, s_needed))
-                    defended = True
-                    break
-            if defended:
-                timelines = simulate_timelines(
-                    planets, fleet_arrival_map, initial_by_id, angular_vel, comets,
-                    _CURRENT_STEP, comet_ids_set, horizon=horizon,
-                    extra_arrivals=global_extra_arrivals
-                )
-                break
 
-    # ==========================================================
+        pending_defense_moves = []
+        temp_extra_arrivals = defaultdict(list)
+        for k, v in global_extra_arrivals.items():
+            temp_extra_arrivals[k] = list(v)
+
+        defended = False
+        for src in candidates:
+            surplus = available_ships[src.id]
+            res = find_intercept_angle_and_time(src, target_p, initial_by_id, angular_vel,
+                                                comets, _CURRENT_STEP, surplus, horizon)
+            if res:
+                angle, T = res
+                if T <= t_fall:
+                    pending_defense_moves.append((src.id, angle, surplus, T))
+                    temp_extra_arrivals[target_id].append((T, player, surplus))
+
+                    test_tl = simulate_timelines(
+                        [target_p], fleet_arrival_map, initial_by_id, angular_vel,
+                        comets, _CURRENT_STEP, comet_ids_set,
+                        horizon=t_fall + 2, extra_arrivals=temp_extra_arrivals
+                    )
+                    t_check = min(t_fall, len(test_tl[target_id]) - 1)
+                    if test_tl[target_id][t_check].owner == player:
+                        # Defended! Commit moves.
+                        for s_id, ang, s_count, t_arr in pending_defense_moves:
+                            moves.append([s_id, ang, s_count])
+                            available_ships[s_id] -= s_count
+                            global_extra_arrivals[target_id].append((t_arr, player, s_count))
+                        timelines = simulate_timelines(
+                            planets, fleet_arrival_map, initial_by_id, angular_vel, comets,
+                            _CURRENT_STEP, comet_ids_set, horizon=horizon,
+                            extra_arrivals=global_extra_arrivals
+                        )
+                        defended = True
+                        break
+        if defended:
+            continue
+
     # PHASE 3: Tactical snipe
     # ==========================================================
     my_total_prod    = sum(p.production for p in my_planets)
