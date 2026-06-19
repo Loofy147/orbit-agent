@@ -214,41 +214,42 @@ def find_ships_for_arrival_turn(src, target, target_turn, initial_by_id, angular
 def find_fleet_target_and_arrival(fleet, planets, initial_by_id, angular_velocity, comets, step, max_steps=80):
     fx, fy = fleet.x, fleet.y
     speed = fleet_speed(fleet.ships)
-    cos_a = math.cos(fleet.angle)
-    sin_a = math.sin(fleet.angle)
-    dx, dy = speed * cos_a, speed * sin_a
+    dx = speed * math.cos(fleet.angle)
+    dy = speed * math.sin(fleet.angle)
 
-    p_data = []
-    for p in planets:
-        p_data.append((p.id, p, p.radius, p.radius**2))
+    # Cache radii squared
+    p_data = [(p, p.radius**2) for p in planets]
 
     for t in range(1, max_steps):
         fnx, fny = fx + dx, fy + dy
+        # Optimized sun check (no safety for simulation speed)
+        if point_to_segment_dist_sq(50.0, 50.0, fx, fy, fnx, fny) < 100.0:
+            return None, None
 
-        if fx < fnx: min_x, max_x = fx, fnx
-        else: min_x, max_x = fnx, fx
-        if fy < fny: min_y, max_y = fy, fny
-        else: min_y, max_y = fny, fy
+        # Segment bounding box
+        min_x, max_x = (fx, fnx) if fx < fnx else (fnx, fx)
+        min_y, max_y = (fy, fny) if fy < fny else (fny, fy)
 
-        # Sun collision (radius 10, center 50,50). Bounding box check first.
-        if min_x < 60.0 and max_x > 40.0 and min_y < 60.0 and max_y > 40.0:
-             if point_to_segment_dist_sq(50.0, 50.0, fx, fy, fnx, fny) < 100.0:
-                 return None, None
+        for p, r_sq in p_data:
+            if p.id == fleet.from_planet_id and t <= 2: continue
 
-        for p_id, p_obj, p_r, r_sq in p_data:
-            if p_id == fleet.from_planet_id and t <= 2: continue
-            pos = predict_position(p_id, p_obj, initial_by_id, angular_velocity, comets, step, t)
+            pos = predict_position(p.id, p, initial_by_id, angular_velocity, comets, step, t)
             if pos is None: continue
             px, py = pos
-            if px < min_x - p_r or px > max_x + p_r or py < min_y - p_r or py > max_y + p_r:
+
+            # Rough bounding box filter
+            if px < min_x - p.radius or px > max_x + p.radius or py < min_y - p.radius or py > max_y + p.radius:
                 continue
+
             if point_to_segment_dist_sq(px, py, fx, fy, fnx, fny) < r_sq:
-                return p_id, t
+                return p.id, t
 
         if fnx < 0.0 or fnx > 100.0 or fny < 0.0 or fny > 100.0:
             return None, None
         fx, fy = fnx, fny
     return None, None
+
+# --- Precompute Fleet Arrivals ---
 
 def precompute_fleet_arrivals(fleets, planets, initial_by_id, angular_velocity, comets, step, horizon):
     """Returns {fleet_id: (target_id, arr_turns, owner, ships)} — computed once per turn."""
@@ -504,14 +505,7 @@ def agent(obs):
     comet_ids_set   = set(comet_pids)
     global _COMET_IDS_TURN, _COMET_LIFE_TURN
     _COMET_IDS_TURN = comet_ids_set
-    _COMET_LIFE_TURN = {}
-    for g in comets:
-        pids = g.get("planet_ids", [])
-        paths = g.get("paths", [])
-        path_idx = g.get("path_index", 0)
-        for j, pid in enumerate(pids):
-            if j < len(paths):
-                _COMET_LIFE_TURN[pid] = max(0, len(paths[j]) - path_idx)
+    _COMET_LIFE_TURN = {pid: get_comet_life(pid, comets) for pid in comet_pids}
 
 
     planet_by_id    = {p.id: p for p in planets}
