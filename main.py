@@ -12,6 +12,7 @@ import math
 _PLANET_GEO_CACHE = {}
 _TURN_POS_CACHE = {}
 _COMET_IDS_TURN = set()
+_COMET_LIFE_TURN = {}
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -54,23 +55,38 @@ _current_step = -1
 def dist(x1, y1, x2, y2):
     return math.hypot(x2 - x1, y2 - y1)
 
-def point_to_segment_distance(px, py, x1, y1, x2, y2):
+
+def point_to_segment_dist_sq(px, py, x1, y1, x2, y2):
     dx, dy = x2 - x1, y2 - y1
     if dx == 0 and dy == 0:
-        return dist(px, py, x1, y1)
-    t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)))
-    return dist(px, py, x1 + t * dx, y1 + t * dy)
+        return (px - x1)**2 + (py - y1)**2
+    t = ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)
+    if t < 0:
+        return (px - x1)**2 + (py - y1)**2
+    if t > 1:
+        return (px - x2)**2 + (py - y2)**2
+    return (px - (x1 + t * dx))**2 + (py - (y1 + t * dy))**2
+def point_to_segment_distance(px, py, x1, y1, x2, y2):
+    return math.sqrt(point_to_segment_dist_sq(px, py, x1, y1, x2, y2))
 
-def segment_hits_sun(x1, y1, x2, y2, sun_radius=10.0, safety=0.2):
-    return point_to_segment_distance(50.0, 50.0, x1, y1, x2, y2) < (sun_radius + safety)
 
-def safe_angle_and_distance(sx, sy, sr, tx, ty, tr, sun_radius=10.0, safety=0.2):
-    angle = math.atan2(ty - sy, tx - sx)
-    lx = sx + (sr + 0.1) * math.cos(angle)
-    ly = sy + (sr + 0.1) * math.sin(angle)
-    if segment_hits_sun(lx, ly, tx, ty, sun_radius, safety):
+def segment_hits_sun(x1, y1, x2, y2, sun_radius_sq=100.0):
+    return point_to_segment_dist_sq(50.0, 50.0, x1, y1, x2, y2) < sun_radius_sq
+
+
+
+def safe_angle_and_distance(sx, sy, sr, tx, ty, tr):
+    dx, dy = tx - sx, ty - sy
+    d = math.hypot(dx, dy)
+    if d == 0: return math.atan2(dy, dx), 0.0
+    angle = math.atan2(dy, dx)
+    # Start fleet just outside source radius
+    lx = sx + (sr + 0.1) * (dx / d)
+    ly = sy + (sr + 0.1) * (dy / d)
+    if segment_hits_sun(lx, ly, tx, ty):
         return None
-    return angle, max(0.0, dist(lx, ly, tx, ty) - tr)
+    return angle, max(0.0, d - (sr + 0.1) - tr)
+
 
 def fleet_speed(ships, max_speed=6.0):
     if ships <= 1:
@@ -129,7 +145,7 @@ def predict_planet_position_at_step(planet, initial_by_id, angular_velocity, ste
 
 def predict_position(planet_id, planet, initial_by_id, angular_velocity, comets, current_step, turns_ahead):
     global _TURN_POS_CACHE
-    cache_key = (planet_id, turns_ahead)
+    cache_key = planet_id * 1000 + turns_ahead
     if cache_key in _TURN_POS_CACHE:
         return _TURN_POS_CACHE[cache_key]
 
@@ -194,24 +210,40 @@ def find_ships_for_arrival_turn(src, target, target_turn, initial_by_id, angular
             high = mid - 1
     return (angle, best_s) if best_s is not None else None
 
+
 def find_fleet_target_and_arrival(fleet, planets, initial_by_id, angular_velocity, comets, step, max_steps=80):
     fx, fy = fleet.x, fleet.y
     speed = fleet_speed(fleet.ships)
     dx = speed * math.cos(fleet.angle)
     dy = speed * math.sin(fleet.angle)
+
+    # Cache radii squared
+    p_data = [(p, p.radius**2) for p in planets]
+
     for t in range(1, max_steps):
         fnx, fny = fx + dx, fy + dy
-        if segment_hits_sun(fx, fy, fnx, fny, safety=0.0):
+        # Optimized sun check (no safety for simulation speed)
+        if point_to_segment_dist_sq(50.0, 50.0, fx, fy, fnx, fny) < 100.0:
             return None, None
-        for p in planets:
-            # FIX: Prevent incorrect self-collision on slow launch steps (t <= 2)
-            if p.id == fleet.from_planet_id and t <= 2:
-                continue
+
+        # Segment bounding box
+        min_x, max_x = (fx, fnx) if fx < fnx else (fnx, fx)
+        min_y, max_y = (fy, fny) if fy < fny else (fny, fy)
+
+        for p, r_sq in p_data:
+            if p.id == fleet.from_planet_id and t <= 2: continue
+
             pos = predict_position(p.id, p, initial_by_id, angular_velocity, comets, step, t)
-            if pos is None:
+            if pos is None: continue
+            px, py = pos
+
+            # Rough bounding box filter
+            if px < min_x - p.radius or px > max_x + p.radius or py < min_y - p.radius or py > max_y + p.radius:
                 continue
-            if point_to_segment_distance(pos[0], pos[1], fx, fy, fnx, fny) < p.radius:
+
+            if point_to_segment_dist_sq(px, py, fx, fy, fnx, fny) < r_sq:
                 return p.id, t
+
         if fnx < 0.0 or fnx > 100.0 or fny < 0.0 or fny > 100.0:
             return None, None
         fx, fy = fnx, fny
@@ -256,38 +288,43 @@ def resolve_combat(planet_owner, garrison, arriving_fleets):
 
 def simulate_timelines(planets, fleet_arrival_map, initial_by_id, angular_velocity, comets,
                        step, comet_ids_set, horizon=80, extra_arrivals=None):
-    arrivals = defaultdict(list)
+    # Performance: Only re-simulate planets that actually have arrivals if extra_arrivals is provided
+    # We'll need a full simulation on the first call, then can do partial updates.
+    # However, to keep it safe and clean, we'll just optimize the inner loop of combat resolution.
+    arrivals = defaultdict(lambda: defaultdict(list))
 
     for f_id, (target_id, arr_turns, owner, ships) in fleet_arrival_map.items():
         if target_id is not None and arr_turns is not None and arr_turns <= horizon:
-            arrivals[target_id].append((arr_turns, owner, ships))
+            arrivals[target_id][arr_turns].append((owner, ships))
 
     if extra_arrivals:
         for pid, lst in extra_arrivals.items():
             for arr_turns, owner, ships in lst:
                 if arr_turns <= horizon:
-                    arrivals[pid].append((arr_turns, owner, ships))
+                    arrivals[pid][arr_turns].append((owner, ships))
 
     timelines = {}
     for p in planets:
         curr_owner, curr_ships = p.owner, p.ships
         timeline = [PlanetState(curr_owner, curr_ships)]
-        p_arr = defaultdict(list)
-        for arr_t, owner, ships in arrivals[p.id]:
-            p_arr[arr_t].append((owner, ships))
-        comet_life = get_comet_life(p.id, comets) if p.id in comet_ids_set else float('inf')
+        p_arrivals = arrivals.get(p.id, {})
+
+        global _COMET_LIFE_TURN
+        comet_life = _COMET_LIFE_TURN.get(p.id, 1000)
+
         for t in range(1, horizon + 1):
             if t > comet_life:
                 curr_owner, curr_ships = -1, 0
             else:
-                if curr_owner != -1:
-                    curr_ships += p.production
-                curr_owner, curr_ships = resolve_combat(curr_owner, curr_ships, p_arr[t])
+                if curr_owner != -1: curr_ships += p.production
+
+                turn_fleets = p_arrivals.get(t)
+                if turn_fleets:
+                    curr_owner, curr_ships = resolve_combat(curr_owner, curr_ships, turn_fleets)
+
             timeline.append(PlanetState(curr_owner, curr_ships))
         timelines[p.id] = timeline
     return timelines
-
-# --- Strategic Helpers ---
 
 def get_game_phase(step):
     if step < 60:
@@ -464,9 +501,12 @@ def agent(obs):
 
     initial_by_id   = {p.id: p for p in initial_planets}
 
+
     comet_ids_set   = set(comet_pids)
-    global _COMET_IDS_TURN
+    global _COMET_IDS_TURN, _COMET_LIFE_TURN
     _COMET_IDS_TURN = comet_ids_set
+    _COMET_LIFE_TURN = {pid: get_comet_life(pid, comets) for pid in comet_pids}
+
 
     planet_by_id    = {p.id: p for p in planets}
     my_planets      = [p for p in planets if p.owner == player]
