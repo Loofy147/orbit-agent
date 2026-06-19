@@ -1,3 +1,4 @@
+%%writefile main.py
 from __future__ import annotations
 
 import dataclasses
@@ -60,7 +61,7 @@ class ProducerLiteConfig:
     max_offensive_targets: int = 12
     max_defensive_targets: int = 6
     max_waves_per_turn: int = 6
-    roi_threshold: float = 1.25
+    roi_threshold: float = 1.35
     min_ships_to_launch: float = 4.0
     reinforce_size_beta: float = 2.2
     reinforce_eta_free: float = 3.0
@@ -90,13 +91,13 @@ class ProducerLiteConfig:
     prod_rush_top_k: int = 3
     prod_rush_roi_discount: float = 0.80
     # Comet hunting
-    comet_score_multiplier: float = 2.5
+    comet_score_multiplier: float = 2.0
     comet_movement_threshold: float = 0.5
     # ---- NEW: Nearest/Furthest wave split ----
     near_wave_fraction: float = 0.65   # fraction of W waves allocated to nearest targets
     # ---- NEW: Shrinking ring conquest ----
     enable_ring_conquest: bool = True
-    ring_inner_boost: float = 2.5      # score multiplier for targets inside conquest ring
+    ring_inner_boost: float = 2.0      # score multiplier for targets inside conquest ring
     ring_outer_penalty: float = 0.4    # score multiplier for targets outside ring
     ring_min_radius_frac: float = 0.15 # ring never shrinks below this fraction of map radius
     # ---- NEW: KNN source selection ----
@@ -1197,3 +1198,97 @@ def agent(obs):
     with torch.no_grad():
         sparse_row = _RUNTIME.tensor_action(obs_tensors)
     return sparse_action_row_to_moves(sparse_row, obs, player_id=player_id)
+
+import shutil, subprocess, sys, tarfile, tempfile
+from pathlib import Path
+
+WORK = Path("/kaggle/working")
+MAIN = WORK / "main.py"
+ARCHIVE = WORK / "submission.tar.gz"
+
+EXPECTED_ORBIT_LITE = {
+    "__init__.py", "adapter.py", "aiming.py", "constants.py", "distance_cache.py",
+    "garrison_launch.py", "geometry.py", "intercept_aim.py", "movement.py",
+    "movement_aiming.py", "movement_step.py", "obs.py", "planner_core.py",
+}
+EXPECTED_MEMBERS = {"main.py"} | {f"orbit_lite/{name}" for name in EXPECTED_ORBIT_LITE}
+
+def py_files(d: Path) -> set:
+    return {p.name for p in d.glob("*.py")}
+
+if not MAIN.is_file():
+    print("=" * 72)
+    print("ERROR: /kaggle/working/main.py does not exist.")
+    print()
+    print("This cell only PACKAGES main.py - it does not create it. Run the")
+    print("'%%writefile main.py' code cell above first, then re-run this cell.")
+    print("(Note: this cell deletes main.py after a successful build, so a")
+    print("re-run also needs the %%writefile cell executed again.)")
+    print("=" * 72)
+    raise FileNotFoundError(MAIN)
+
+known_layouts = [
+    Path("/kaggle/input/datasets/slawekbiel/producer-orbit-wars-utils/orbit_lite"),
+    Path("/kaggle/input/producer-orbit-wars-utils/orbit_lite"),
+]
+candidates = [d for d in known_layouts if d.is_dir()]
+if not candidates:
+    print("known layouts not found, scanning /kaggle/input ...")
+    candidates = sorted(d for d in Path("/kaggle/input").rglob("orbit_lite") if d.is_dir())
+print(f"orbit_lite candidates: {len(candidates)}")
+for d in candidates:
+    missing = sorted(EXPECTED_ORBIT_LITE - py_files(d))
+    extra = sorted(py_files(d) - EXPECTED_ORBIT_LITE)
+    print(f"  {d}\n    missing={missing or 'none'}  extra-py={extra or 'none'}")
+exact = [d for d in candidates if EXPECTED_ORBIT_LITE <= py_files(d)]
+assert exact, (
+    "No orbit_lite directory with the expected modules found under /kaggle/input. "
+    "Is the 'producer-orbit-wars-utils' dataset attached to this notebook?"
+)
+SRC = exact[0]
+print(f"using: {SRC}")
+
+build = Path(tempfile.mkdtemp(prefix="submission_build_"))
+shutil.copy2(MAIN, build / "main.py")
+(build / "orbit_lite").mkdir()
+for name in sorted(EXPECTED_ORBIT_LITE):
+    shutil.copy2(SRC / name, build / "orbit_lite" / name)
+
+ARCHIVE.unlink(missing_ok=True)
+with tarfile.open(ARCHIVE, "w:gz") as tar:
+    for rel in sorted(EXPECTED_MEMBERS):
+        tar.add(build / rel, arcname=rel)
+with tarfile.open(ARCHIVE, "r:gz") as tar:
+    members = {m.name for m in tar.getmembers() if m.isfile()}
+print(f"\n{ARCHIVE.name}: {ARCHIVE.stat().st_size:,} bytes, {len(members)} files")
+for name in sorted(members):
+    print(f"  {name}")
+assert members == EXPECTED_MEMBERS, (
+    f"archive mismatch: missing={sorted(EXPECTED_MEMBERS - members)} "
+    f"extra={sorted(members - EXPECTED_MEMBERS)}"
+)
+
+smoke = Path(tempfile.mkdtemp(prefix="submission_smoke_"))
+with tarfile.open(ARCHIVE, "r:gz") as tar:
+    tar.extractall(smoke)
+proc = subprocess.run(
+    [sys.executable, "-c",
+     "import main; assert callable(main.agent), 'main.agent not callable'; "
+     "print('smoke test: packaged agent imports, main.agent is callable')"],
+    cwd=smoke, capture_output=True, text=True,
+)
+print(proc.stdout.strip())
+if proc.returncode != 0:
+    print(proc.stderr)
+    raise RuntimeError("smoke import of the packaged agent failed (stderr above)")
+
+shutil.rmtree(build)
+shutil.rmtree(smoke)
+for p in WORK.iterdir():
+    if p != ARCHIVE:
+        print(f"cleanup: removing {p}")
+        shutil.rmtree(p) if p.is_dir() else p.unlink()
+leftover = sorted(p.name for p in WORK.iterdir())
+print(f"/kaggle/working contents: {leftover}")
+assert leftover == [ARCHIVE.name], f"unexpected leftovers: {leftover}"
+print("\nAll checks passed - submission.tar.gz is ready.")
