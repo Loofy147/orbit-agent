@@ -145,50 +145,6 @@ def intercept_angle(
         contact[midx] = torch.where(keep, contact_m, torch.full_like(contact_m, -1))
         eta_c[midx] = torch.where(keep, eta_cm, torch.full_like(eta_cm, float(H)))
 
-
-    # ---- NEW: Sun-Skimming Trajectories ----
-    # If a direct path is blocked by the sun, try grazing it with small angular offsets.
-    # Note: contact == -1 AND eta_c < H usually implies an environment death (Sun or OOB).
-    # Since we aimed at the target, eta_c < H and contact != tgt means we hit something else.
-    # If point-to-segment distance to sun is small, it's a sun hit.
-
-    viable = (contact == tgt)
-    blocked = ~viable
-    if blocked.any():
-        # Identify sun-blocked candidates: contact == -1 and eta_c < H
-        sun_blocked = blocked & (contact == -1) & (eta_c < H)
-        if sun_blocked.any():
-            sb_idx = sun_blocked.nonzero(as_tuple=False).squeeze(1)
-            # Try offsets: +/- 0.05, 0.1, 0.2, 0.3, 0.4 radians
-            offsets = [0.05, -0.05, 0.1, -0.1, 0.2, -0.2, 0.3, -0.3, 0.4, -0.4]
-
-            for off in offsets:
-                if not sun_blocked.any(): break
-
-                off_angle = angle[sun_blocked] + off
-                off_cos = torch.cos(off_angle)
-                off_sin = torch.sin(off_angle)
-                off_lx = sx[sun_blocked] + off_cos * (src_r[sun_blocked] + LAUNCH_SURFACE_OFFSET)
-                off_ly = sy[sun_blocked] + off_sin * (src_r[sun_blocked] + LAUNCH_SURFACE_OFFSET)
-
-                # Re-verify only for the still-blocked set
-                c_m, e_m = _analytic_first_contact(
-                    launch_x=off_lx, launch_y=off_ly, cos_a=off_cos, sin_a=off_sin,
-                    speed=speed[sun_blocked], px=px, py=py, p_alive0=alive0,
-                    radii=radii_p, H=H, seg_len=seg_len[sun_blocked],
-                )
-
-                success = (c_m == tgt[sun_blocked])
-                if success.any():
-                    # Update winners
-                    s_indices = sb_idx[success]
-                    angle[s_indices] = off_angle[success]
-                    contact[s_indices] = c_m[success]
-                    eta_c[s_indices] = e_m[success]
-                    viable[s_indices] = True
-                    # Update the remaining sun_blocked mask for this loop
-                    sun_blocked[s_indices] = False
-
     viable = contact == tgt                                           # [M]
     eta_out = torch.where(viable, eta_c.to(dt), torch.full_like(eta_c.to(dt), float("inf")))
     return {

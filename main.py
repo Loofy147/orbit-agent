@@ -60,9 +60,9 @@ class ProducerLiteConfig:
     max_offensive_targets: int = 12
     max_defensive_targets: int = 6
     max_waves_per_turn: int = 6
-    roi_threshold: float = 1.25
-    min_ships_to_launch: float = 4.0
-    reinforce_size_beta: float = 2.2
+    roi_threshold: float = 1.12
+    min_ships_to_launch: float = 3.0
+    reinforce_size_beta: float = 1.8
     reinforce_eta_free: float = 3.0
     reinforce_eta_scale: float = 12.0
     enable_regroup: bool = True
@@ -73,8 +73,8 @@ class ProducerLiteConfig:
     regroup_pressure_norm: str = "none"
     regroup_time_penalty_weight: float = 1e-3
     # Dynamic scaling
-    min_roi: float = 1.05
-    max_roi: float = 1.45
+    min_roi: float = 0.95
+    max_roi: float = 1.40
     horizon_min: int = 8
     horizon_max: int = 24
     beta_min: float = 1.2
@@ -88,7 +88,7 @@ class ProducerLiteConfig:
     # Production snowball
     prod_rush_steps: int = 120
     prod_rush_top_k: int = 3
-    prod_rush_roi_discount: float = 0.80
+    prod_rush_roi_discount: float = 0.65
     # Comet hunting
     comet_score_multiplier: float = 2.5
     comet_movement_threshold: float = 0.5
@@ -106,6 +106,9 @@ class ProducerLiteConfig:
     # ---- NEW: Border planet defense boost ----
     border_boost: float = 1.6          # score bonus multiplier for planets on the enemy-facing border
     border_radius_frac: float = 0.30   # fraction of map radius that defines "border"
+    # ---- NEW: Multi-size and Multi-source ----
+    size_multipliers: tuple[float, ...] = (1.0,)
+    max_contributors_per_wave: int = 1
 
 
 # ---------------------------------------------------------------------------
@@ -421,44 +424,74 @@ def _build_defense_entries(
                 entry = make_launch_set(source_slots=src_t, target_slots=tgt_t, ships=send_t, eta=eta_t, valid=valid_t, player_id=pid)
                 all_entries.append(entry)
 
-    # 2. الدفاع العادي للكواكب القابلة للإنقاذ
+
+    # 2. Aggregated Defense for savable planets
     if bool(savable.any()):
         tgt_indices = savable.nonzero(as_tuple=False).squeeze(1)
         src_indices = owned.nonzero(as_tuple=False).squeeze(1)
         d0 = cache.cross_dist[0].to(dtype)
+
+        # Track available ships per source during defense allocation
+        available_ships = current_ships.clone()
         waves_launched = 0
 
         for t_i in range(int(tgt_indices.shape[0])):
             if waves_launched >= int(config.defense_max_waves): break
             tgt = int(tgt_indices[t_i].item())
+
+            # Recalculate deficit at current step
             deficit = float(-ships_at_H[tgt].item())
             need = deficit * float(config.defense_min_intercept_margin)
+            if need <= 0: continue
 
+            # Consider all sources that can arrive by H
             dists = d0[src_indices, tgt]
-            speeds = fleet_speed(current_ships[src_indices].clamp(min=1.0))
+            speeds = fleet_speed(available_ships[src_indices].clamp(min=1.0))
             etas = (dists / speeds.clamp(min=1e-6)).ceil()
 
             can_arrive = etas <= float(H)
-            has_surplus = current_ships[src_indices] > (need + float(config.min_ships_to_launch))
             src_neq_tgt = src_indices != tgt
-            valid_src = can_arrive & has_surplus & src_neq_tgt & (~doomed[src_indices]) # لا نستخدم الكواكب الساقطة للدعم
+            valid_src_mask = can_arrive & src_neq_tgt & (~doomed[src_indices]) & (available_ships[src_indices] > float(config.min_ships_to_launch))
 
-            if not bool(valid_src.any()): continue
+            if not valid_src_mask.any(): continue
 
-            best_src_local = int(torch.where(valid_src, dists, torch.full_like(dists, 1e9)).argmin().item())
-            best_src = int(src_indices[best_src_local].item())
-            send_ships = min(float(current_ships[best_src].item()) * 0.6, need + float(config.min_ships_to_launch))
-            send_ships = max(send_ships, float(config.min_ships_to_launch))
+            # Sort valid sources by distance
+            v_src_idx = src_indices[valid_src_mask]
+            v_dists = dists[valid_src_mask]
+            v_etas = etas[valid_src_mask]
 
-            src_t = torch.tensor([[best_src]], dtype=torch.long, device=device)
-            tgt_t = torch.tensor([[tgt]], dtype=torch.long, device=device)
-            send_t = torch.tensor([[send_ships]], dtype=dtype, device=device)
-            eta_t = torch.tensor([[float(etas[best_src_local].item())]], dtype=dtype, device=device)
-            valid_t = torch.tensor([[True]], dtype=torch.bool, device=device)
+            sorted_indices = torch.argsort(v_dists)
 
-            entry = make_launch_set(source_slots=src_t, target_slots=tgt_t, ships=send_t, eta=eta_t, valid=valid_t, player_id=pid)
-            all_entries.append(entry)
-            waves_launched += 1
+            contributed_ships = 0.0
+            for idx in sorted_indices.tolist():
+                s_idx = int(v_src_idx[idx].item())
+                s_eta = float(v_etas[idx].item())
+
+                # How much can this source give?
+                # Capped at 50% of available to avoid leaving source vulnerable,
+                # or the remaining need.
+                s_surplus = max(0.0, float(available_ships[s_idx].item()) - float(config.min_ships_to_launch))
+                s_give = min(s_surplus * 0.5, need - contributed_ships)
+
+                if s_give >= float(config.min_ships_to_launch):
+                    src_t = torch.tensor([[s_idx]], dtype=torch.long, device=device)
+                    tgt_t = torch.tensor([[tgt]], dtype=torch.long, device=device)
+                    send_t = torch.tensor([[s_give]], dtype=dtype, device=device)
+                    eta_t = torch.tensor([[s_eta]], dtype=dtype, device=device)
+                    valid_t = torch.tensor([[True]], dtype=torch.bool, device=device)
+
+                    entry = make_launch_set(source_slots=src_t, target_slots=tgt_t, ships=send_t, eta=eta_t, valid=valid_t, player_id=pid)
+                    all_entries.append(entry)
+
+                    contributed_ships += s_give
+                    available_ships[s_idx] -= s_give
+
+                if contributed_ships >= need:
+                    break
+
+            if contributed_ships > 0:
+                waves_launched += 1
+
 
     if not all_entries:
         return _empty_entries(device, dtype)
@@ -701,7 +734,10 @@ def _split_near_far_indices(
 ) -> tuple[Tensor, Tensor]:
     """Return (near_mask, far_mask) over the candidate dimension."""
     device = score.device
-    valid_eta = cand_eta.reshape(score.shape)
+    if cand_eta.dim() > 1:
+        valid_eta = cand_eta[:, 0].reshape(score.shape)
+    else:
+        valid_eta = cand_eta.reshape(score.shape)
     valid_scores = torch.where(cand_valid, score, torch.full_like(score, float("-inf")))
 
     valid_eta_vals = valid_eta[cand_valid]
@@ -812,6 +848,7 @@ def plan_lite_waves(
     if not bool(target_exists.any()):
         return _empty_entries(device, dtype)
 
+
     S = int(source_idx.shape[0])
     T = int(target_idx.shape[0])
     target_is_mine = obs.owned[target_idx.clamp(0, P - 1)]
@@ -822,7 +859,7 @@ def plan_lite_waves(
         H_eff=H_eff, player_id=pid,
     )
 
-    eta_cap = torch.full((T,), float(K_eta), dtype=dtype, device=device)
+    eta_cap_val = torch.full((T,), float(K_eta), dtype=dtype, device=device)
 
     beta = float(config.reinforce_size_beta)
     enemy_mass = (
@@ -847,64 +884,187 @@ def plan_lite_waves(
     )
     K = int(floor.shape[-1])
 
-    sizes = drain.view(S, 1).expand(S, T).floor().clamp(min=1.0)
+    all_cand_src = []
+    all_cand_tgt_slot = []
+    all_cand_tgt_short = []
+    all_cand_send = []
+    all_cand_angle = []
+    all_cand_eta = []
+    all_cand_active = []
+    all_cand_valid = []
+    all_cand_is_def = []
+    all_score = []
 
-    active = reachable_mask(
-        movement, source_idx=source_idx, target_idx=target_idx,
-        fleet_sizes=sizes.unsqueeze(-1), eta_cap=eta_cap,
-    ).squeeze(-1)
-    aim = intercept_angle(
-        movement,
-        source_idx.unsqueeze(1),
-        target_idx.unsqueeze(0),
-        sizes,
-        active=active,
-    )
-    angle = aim["angle"]
-    eta = aim["eta"]
-    viable = aim["viable"] & (eta <= eta_cap.view(1, T))
+    L = int(config.max_contributors_per_wave)
 
-    if K > 0:
-        k_arr = (eta.clamp(min=1.0, max=float(K)).ceil().long() - 1).clamp(0, K - 1)
-        floor_at_arr = floor.unsqueeze(0).expand(S, T, K).gather(-1, k_arr.unsqueeze(-1)).squeeze(-1)
-    else:
-        floor_at_arr = torch.ones(S, T, dtype=dtype, device=device)
-    clears_floor = sizes >= floor_at_arr
+    for size_mult in config.size_multipliers:
+        # Sizes for [S, T] pairs
+        sizes_st = (drain.view(S, 1) * float(size_mult)).floor().clamp(min=1.0).expand(S, T)
 
-    src_neq_tgt = source_idx.view(S, 1) != target_idx.view(1, T)
-    valid = (
-        viable & clears_floor & (sizes >= float(config.min_ships_to_launch))
-        & src_neq_tgt & source_exists.view(S, 1) & target_exists.view(1, T)
-    )
+        active_st = reachable_mask(
+            movement, source_idx=source_idx, target_idx=target_idx,
+            fleet_sizes=sizes_st.unsqueeze(-1), eta_cap=eta_cap_val,
+        ).squeeze(-1)
 
-    L = 1
-    C = S * T
-    cand_src = source_idx.view(S, 1).expand(S, T).reshape(C, L)
-    cand_tgt_slot = target_idx.view(1, T).expand(S, T).reshape(C)
-    cand_tgt_short = torch.arange(T, device=device).view(1, T).expand(S, T).reshape(C)
-    cand_send = torch.where(valid, sizes, torch.zeros_like(sizes)).reshape(C, L)
-    cand_angle = angle.reshape(C, L)
-    cand_eta = torch.where(valid, eta, torch.ones_like(eta)).reshape(C, L)
-    cand_active = valid.reshape(C, L)
-    cand_valid = valid.reshape(C)
-    cand_is_def = target_is_mine[cand_tgt_short]
+        aim = intercept_angle(
+            movement, source_idx.unsqueeze(1), target_idx.unsqueeze(0),
+            sizes_st, active=active_st,
+        )
+        angle_st = aim["angle"]
+        eta_st = aim["eta"]
+        viable_st = aim["viable"] & (eta_st <= eta_cap_val.view(1, T))
 
-    launches = make_launch_set(
-        source_slots=cand_src,
-        target_slots=cand_tgt_slot.unsqueeze(-1).expand(C, L),
-        ships=cand_send,
-        eta=cand_eta,
-        valid=cand_active & cand_valid.unsqueeze(-1),
-        player_id=pid,
-    )
-    score = score_candidates(
-        garrison_status, prod=prod, alive_by_step=alive_by_step,
-        player_count=int(player_count), launches=launches, player_id=pid,
-    )
+        if L == 1:
+            # Traditional single-source candidates
+            if K > 0:
+                k_arr = (eta_st.clamp(min=1.0, max=float(K)).ceil().long() - 1).clamp(0, K - 1)
+                floor_at_arr = floor.unsqueeze(0).expand(S, T, K).gather(-1, k_arr.unsqueeze(-1)).squeeze(-1)
+            else:
+                floor_at_arr = torch.ones(S, T, dtype=dtype, device=device)
+
+            clears_floor = sizes_st >= floor_at_arr
+            src_neq_tgt = source_idx.view(S, 1) != target_idx.view(1, T)
+            valid_st = viable_st & clears_floor & (sizes_st >= float(config.min_ships_to_launch)) & src_neq_tgt
+
+            C = S * T
+            c_src = source_idx.view(S, 1).expand(S, T).reshape(C, 1)
+            c_tgt_slot = target_idx.view(1, T).expand(S, T).reshape(C)
+            c_tgt_short = torch.arange(T, device=device).view(1, T).expand(S, T).reshape(C)
+            c_send = torch.where(valid_st, sizes_st, torch.zeros_like(sizes_st)).reshape(C, 1)
+            c_angle = angle_st.reshape(C, 1)
+            c_eta = torch.where(valid_st, eta_st, torch.ones_like(eta_st)).reshape(C, 1)
+            c_active = valid_st.reshape(C, 1)
+            c_valid = valid_st.reshape(C)
+
+            # Score them
+            launches = make_launch_set(
+                source_slots=c_src, target_slots=c_tgt_slot.unsqueeze(-1),
+                ships=c_send, eta=c_eta, valid=c_active & c_valid.unsqueeze(-1), player_id=pid
+            )
+            c_score = score_candidates(garrison_status, prod=prod, alive_by_step=alive_by_step,
+                                       player_count=int(player_count), launches=launches, player_id=pid)
+
+            all_cand_src.append(c_src)
+            all_cand_tgt_slot.append(c_tgt_slot)
+            all_cand_tgt_short.append(c_tgt_short)
+            all_cand_send.append(c_send)
+            all_cand_angle.append(c_angle)
+            all_cand_eta.append(c_eta)
+            all_cand_active.append(c_active)
+            all_cand_valid.append(c_valid)
+            all_cand_is_def.append(target_is_mine[c_tgt_short])
+            all_score.append(c_score)
+
+        else:
+            # Vectorized Multi-source synchronization: group by (target, arrival_turn)
+            multi_c_src = []
+            multi_c_send = []
+            multi_c_angle = []
+            multi_c_eta = []
+            multi_c_active = []
+            multi_c_tgt_slot = []
+            multi_c_tgt_short = []
+            multi_c_valid = []
+
+            # We pre-calculate turns for all [S, T] pairs
+            turns_st = eta_st.ceil().long()
+
+            for t_idx in range(T):
+                target_abs = int(target_idx[t_idx].item())
+                target_floor = floor[t_idx] # [K]
+
+                eta_t = eta_st[:, t_idx]
+                viable_t = viable_st[:, t_idx]
+                turns_t = turns_st[:, t_idx]
+
+                # Possible turns are those where at least one source arrives
+                possible_turns = torch.unique(turns_t[viable_t])
+
+                for k in possible_turns.tolist():
+                    k = int(k)
+                    if k < 1 or k > K_eta: continue
+
+                    mask_k = viable_t & (turns_t == k)
+                    indices_k = mask_k.nonzero(as_tuple=False).squeeze(1)
+
+                    scores_k = source_score[source_idx[indices_k]]
+                    top_k_indices = indices_k[torch.argsort(scores_k, descending=True)[:L]]
+
+                    ships_k = sizes_st[top_k_indices, t_idx]
+                    total_ships = ships_k.sum()
+
+                    if total_ships < target_floor[k-1] or total_ships < float(config.min_ships_to_launch):
+                        continue
+
+                    src_row = torch.zeros(L, dtype=torch.long, device=device)
+                    send_row = torch.zeros(L, dtype=dtype, device=device)
+                    angle_row = torch.zeros(L, dtype=dtype, device=device)
+                    eta_row = torch.ones(L, dtype=dtype, device=device)
+                    active_row = torch.zeros(L, dtype=torch.bool, device=device)
+
+                    n_contrib = top_k_indices.numel()
+                    src_row[:n_contrib] = source_idx[top_k_indices]
+                    send_row[:n_contrib] = ships_k
+                    angle_row[:n_contrib] = angle_st[top_k_indices, t_idx]
+                    eta_row[:n_contrib] = eta_t[top_k_indices]
+                    active_row[:n_contrib] = True
+
+                    multi_c_src.append(src_row)
+                    multi_c_send.append(send_row)
+                    multi_c_angle.append(angle_row)
+                    multi_c_eta.append(eta_row)
+                    multi_c_active.append(active_row)
+                    multi_c_tgt_slot.append(target_abs)
+                    multi_c_tgt_short.append(t_idx)
+                    multi_c_valid.append(True)
+
+            if multi_c_valid:
+                c_src = torch.stack(multi_c_src, dim=0)
+                c_send = torch.stack(multi_c_send, dim=0)
+                c_angle = torch.stack(multi_c_angle, dim=0)
+                c_eta = torch.stack(multi_c_eta, dim=0)
+                c_active = torch.stack(multi_c_active, dim=0)
+                c_tgt_slot = torch.tensor(multi_c_tgt_slot, dtype=torch.long, device=device)
+                c_tgt_short = torch.tensor(multi_c_tgt_short, dtype=torch.long, device=device)
+                c_valid = torch.tensor(multi_c_valid, dtype=torch.bool, device=device)
+
+                launches = make_launch_set(
+                    source_slots=c_src, target_slots=c_tgt_slot.unsqueeze(-1).expand(-1, L),
+                    ships=c_send, eta=c_eta, valid=c_active & c_valid.unsqueeze(-1), player_id=pid
+                )
+                c_score = score_candidates(garrison_status, prod=prod, alive_by_step=alive_by_step,
+                                           player_count=int(player_count), launches=launches, player_id=pid)
+
+                all_cand_src.append(c_src)
+                all_cand_tgt_slot.append(c_tgt_slot)
+                all_cand_tgt_short.append(c_tgt_short)
+                all_cand_send.append(c_send)
+                all_cand_angle.append(c_angle)
+                all_cand_eta.append(c_eta)
+                all_cand_active.append(c_active)
+                all_cand_valid.append(c_valid)
+                all_cand_is_def.append(target_is_mine[c_tgt_short])
+                all_score.append(c_score)
+
+
+    if not all_score:
+        return _empty_entries(device, dtype)
+
+    cand_src = torch.cat(all_cand_src, dim=0)
+    cand_tgt_slot = torch.cat(all_cand_tgt_slot, dim=0)
+    cand_tgt_short = torch.cat(all_cand_tgt_short, dim=0)
+    cand_send = torch.cat(all_cand_send, dim=0)
+    cand_angle = torch.cat(all_cand_angle, dim=0)
+    cand_eta = torch.cat(all_cand_eta, dim=0)
+    cand_active = torch.cat(all_cand_active, dim=0)
+    cand_valid = torch.cat(all_cand_valid, dim=0)
+    cand_is_def = torch.cat(all_cand_is_def, dim=0)
+    score = torch.cat(all_score, dim=0)
 
     # ---- NEW: Adaptive distance penalty ----
     dist_matrix = cache.cross_dist[0].to(dtype)
-    cand_src_abs = cand_src.squeeze(-1)
+    # For multi-source, use the distance from the FIRST contributor (usually the strongest)
+    cand_src_abs = cand_src[:, 0]
     cand_tgt_abs = cand_tgt_slot
     dist = dist_matrix[cand_src_abs, cand_tgt_abs]
     distance_scale = _adaptive_distance_scale(dist, cache, obs)
@@ -940,6 +1100,7 @@ def plan_lite_waves(
             cos_sim = (candidate_vec_norm * strategic_vec).sum(dim=1)
             align_weight = 1.0 + 0.5 * (cos_sim + 1.0)
             score = score * align_weight.reshape(score.shape)
+
 
     # Late-game suppression
     score = _suppress_late_candidates(
@@ -987,16 +1148,17 @@ def plan_lite_waves(
         cand_is_def=cand_is_def, source_budget=obs.ships.to(dtype).clone(),
         target_exists=target_exists, roi_threshold=float(config.roi_threshold),
     )
+    # far_leftover is the budget after near greedy pass
     far_entries, far_leftover = _greedy_select(
         P=P, W=W_far, device=device, dtype=dtype, score=score_far,
         cand_src=cand_src, cand_send=cand_send, cand_angle=cand_angle, cand_eta=cand_eta,
         cand_active=cand_active, cand_tgt_slot=cand_tgt_slot, cand_tgt_short=cand_tgt_short,
-        cand_is_def=cand_is_def, source_budget=obs.ships.to(dtype).clone(),
+        cand_is_def=cand_is_def, source_budget=near_leftover,
         target_exists=target_exists, roi_threshold=float(config.roi_threshold),
     )
     wave_entries = concat_launch_entries([near_entries, far_entries])
     # Merge leftovers for regroup
-    leftover = near_leftover  # primary leftover for regroup pass
+    leftover = far_leftover   # primary leftover for regroup pass
 
     # ---- NEW: Track committed targets in memory ----
     # Collect target planet ids from this turn's launches so next turn we
@@ -1093,7 +1255,11 @@ def run_turn(obs_tensors: dict, *, config: ProducerLiteConfig, player_count: int
 # Mode presets
 # ---------------------------------------------------------------------------
 
-CONFIG_2P = ProducerLiteConfig()
+CONFIG_2P = replace(
+    ProducerLiteConfig(),
+    size_multipliers=(1.0,),
+    max_contributors_per_wave=1,
+)
 
 CONFIG_3P = replace(
     ProducerLiteConfig(),
@@ -1101,28 +1267,34 @@ CONFIG_3P = replace(
     max_sources_per_lane=8,
     max_offensive_targets=10,
     max_defensive_targets=5,
-    roi_threshold=1.30,
+    roi_threshold=1.10,
     prod_rush_steps=100,
     near_wave_fraction=0.60,
     ring_inner_boost=1.8,
+    size_multipliers=(0.5, 1.0),
+    max_contributors_per_wave=2,
+    reinforce_size_beta=1.5,
 )
 
 CONFIG_4P = replace(
     ProducerLiteConfig(),
-    horizon=13,
-    roi_threshold=1.20,
-    max_sources_per_lane=7,
+    horizon=14,
+    roi_threshold=1.05,
+    max_sources_per_lane=8,
     max_defensive_targets=4,
-    max_waves_per_turn=5,
-    max_regroup_time=6.0,
-    max_regroup_targets_per_source=8,
-    prod_rush_steps=80,
-    geometry_weight=0.45,
-    near_wave_fraction=0.55,  # more far-reaching in crowded maps
-    ring_inner_boost=1.5,
-    ring_outer_penalty=0.5,
-    knn_sources_per_target=2,
-    border_boost=1.8,
+    max_waves_per_turn=6,
+    max_regroup_time=5.0,
+    max_regroup_targets_per_source=6,
+    prod_rush_steps=85,
+    geometry_weight=0.40,
+    near_wave_fraction=0.60,
+    ring_inner_boost=1.8,
+    ring_outer_penalty=0.4,
+    knn_sources_per_target=3,
+    border_boost=2.0,
+    size_multipliers=(0.33, 0.66, 1.0),
+    max_contributors_per_wave=3,
+    reinforce_size_beta=0.0,
 )
 
 

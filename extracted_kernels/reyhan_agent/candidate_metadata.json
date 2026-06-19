@@ -1,0 +1,40 @@
+{
+  "base_candidate": "/Users/pilkwang/Documents/VSDocs/Kaggle/26_OrbitWar/search_runs/0612_strategy_update_20260613/candidates/cand_0612_A_4p_econ_micro",
+  "candidate_id": "cand_0615_A_L0014_reinforce_risk",
+  "changed_axes": [
+    "L"
+  ],
+  "created_for": "0615_public_top3_derivatives",
+  "delta_params": {
+    "config_2p": {
+      "max_regroup_targets_per_source": 4
+    },
+    "config_4p": {
+      "max_regroup_targets_per_source": 4
+    }
+  },
+  "family": "logistics_regroup",
+  "generator": "search/generate_candidates.py",
+  "notes": "L:max_regroup_targets_per_source=4",
+  "params": {
+    "config_2p": {
+      "max_regroup_targets_per_source": 4,
+      "max_regroup_time": 5.0,
+      "min_ships_to_launch": 3.0
+    },
+    "config_4p": {
+      "horizon": 15,
+      "max_offensive_targets": 14,
+      "max_regroup_targets_per_source": 4,
+      "max_regroup_time": 5.0,
+      "max_sources_per_lane": 8,
+      "min_ships_to_launch": 3.0,
+      "size_multipliers": [
+        0.33,
+        0.66,
+        1.0
+      ]
+    }
+  },
+  "parent": "cand_L_0014"
+}
