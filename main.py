@@ -9,6 +9,9 @@ Key Improvements:
 """
 
 import math
+_PLANET_GEO_CACHE = {}
+_TURN_POS_CACHE = {}
+_COMET_IDS_TURN = set()
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -100,24 +103,49 @@ def predict_comet_position_at_turn(planet_id, comets, turns_ahead):
                 return paths[idx][target_idx][0], paths[idx][target_idx][1]
     return None
 
+
 def predict_planet_position_at_step(planet, initial_by_id, angular_velocity, step):
-    init = initial_by_id.get(planet.id)
-    if init is None:
-        return planet.x, planet.y
-    dx_c, dy_c = init.x - 50.0, init.y - 50.0
-    orb_r = math.hypot(dx_c, dy_c)
-    if orb_r + init.radius >= 50.0:
-        return init.x, init.y
-    theta = math.atan2(dy_c, dx_c) + angular_velocity * step
-    return 50.0 + orb_r * math.cos(theta), 50.0 + orb_r * math.sin(theta)
+    global _PLANET_GEO_CACHE
+    if planet.id not in _PLANET_GEO_CACHE:
+        init = initial_by_id.get(planet.id)
+        if init is None:
+            _PLANET_GEO_CACHE[planet.id] = (planet.x, planet.y, 0, 0, False)
+        else:
+            dx_c, dy_c = init.x - 50.0, init.y - 50.0
+            orb_r = math.hypot(dx_c, dy_c)
+            if orb_r + init.radius >= 50.0:
+                _PLANET_GEO_CACHE[planet.id] = (init.x, init.y, 0, 0, False)
+            else:
+                theta = math.atan2(dy_c, dx_c)
+                _PLANET_GEO_CACHE[planet.id] = (50.0, 50.0, orb_r, theta, True)
+
+    cx, cy, r, t0, moves = _PLANET_GEO_CACHE[planet.id]
+    if not moves:
+        return cx, cy
+    theta = t0 + angular_velocity * step
+    return cx + r * math.cos(theta), cy + r * math.sin(theta)
+
+
 
 def predict_position(planet_id, planet, initial_by_id, angular_velocity, comets, current_step, turns_ahead):
+    global _TURN_POS_CACHE
+    cache_key = (planet_id, turns_ahead)
+    if cache_key in _TURN_POS_CACHE:
+        return _TURN_POS_CACHE[cache_key]
+
     if turns_ahead == 0:
         return planet.x, planet.y
-    is_comet = any(planet_id in g.get("planet_ids", []) for g in comets)
+
+    global _COMET_IDS_TURN
+    is_comet = planet_id in _COMET_IDS_TURN
     if is_comet:
-        return predict_comet_position_at_turn(planet_id, comets, turns_ahead)
-    return predict_planet_position_at_step(planet, initial_by_id, angular_velocity, current_step + turns_ahead)
+        res = predict_comet_position_at_turn(planet_id, comets, turns_ahead)
+    else:
+        res = predict_planet_position_at_step(planet, initial_by_id, angular_velocity, current_step + turns_ahead)
+
+    _TURN_POS_CACHE[cache_key] = res
+    return res
+
 
 # --- Intercept Solving (Optimized) ---
 
@@ -388,6 +416,8 @@ def get_obs_val(obs, key, default):
 # --- Main Agent ---
 
 def agent(obs):
+    global _TURN_POS_CACHE
+    _TURN_POS_CACHE = {}
     _current_step = obs.get("step", 0)
 
     player          = get_obs_val(obs, "player", 0)
@@ -433,7 +463,11 @@ def agent(obs):
             fleets.append(Fleet(f.id, f.owner, f.x, f.y, f.angle, f.from_planet_id, f.ships))
 
     initial_by_id   = {p.id: p for p in initial_planets}
+
     comet_ids_set   = set(comet_pids)
+    global _COMET_IDS_TURN
+    _COMET_IDS_TURN = comet_ids_set
+
     planet_by_id    = {p.id: p for p in planets}
     my_planets      = [p for p in planets if p.owner == player]
     game_phase      = get_game_phase(_current_step)
