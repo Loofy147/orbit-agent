@@ -116,17 +116,17 @@ class ProducerLiteConfig:
 # ---------------------------------------------------------------------------
 
 def _owner_strength(obs, prod: Tensor, player_count: int) -> Tensor:
+    """Vectorized owner strength: prod + 2.5% ships."""
     dtype = prod.dtype
     device = prod.device
     strength = torch.zeros(int(player_count), dtype=dtype, device=device)
-    owner = obs.owner_abs.to(device=device)
+    owner = obs.owner_abs.to(device=device).long()
     alive = obs.alive.to(device=device)
-    ships = obs.ships.to(device=device, dtype=dtype)
-    prod_v = prod.to(device=device, dtype=dtype)
-    for oid in range(int(player_count)):
-        mask = alive & (owner == oid)
-        if bool(mask.any()):
-            strength[oid] = prod_v[mask].sum() + 0.025 * ships[mask].sum()
+    # Vectorized sum using scatter_add_ to avoid O(A*P) Python loops.
+    # planet_score [P] = prod + 0.025 * ships
+    planet_score = prod.to(dtype) + 0.025 * obs.ships.to(dtype)
+    valid = alive & (owner >= 0)
+    strength.scatter_add_(0, owner[valid], planet_score[valid])
     return strength
 
 

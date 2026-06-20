@@ -42,7 +42,8 @@ def largest_initial_player_count(obs_tensors: dict) -> int:
     owners = owner[mask]
     n_max = 2
     if owners.numel() > 0:
-        n_max = max(n_max, int(torch.unique(owners.long()).numel()))
+        # Sentinel: Cap player count to 4 to prevent resource exhaustion from malformed obs.
+        n_max = min(4, max(n_max, int(torch.unique(owners.long()).numel())))
     return n_max
 
 
