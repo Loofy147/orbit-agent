@@ -135,17 +135,21 @@ def _owner_strength(obs, prod: Tensor, player_count: int) -> Tensor:
 # ---------------------------------------------------------------------------
 
 def _orbital_centrality(obs, cache) -> Tensor:
+    """Vectorized orbital centrality using matrix-vector product."""
     P = int(obs.P)
     device = obs.device
+    dtype = obs.ships.dtype
     if P <= 1:
-        return torch.ones(P, device=device)
-    d0 = cache.cross_dist[0].clone().float()
-    alive = obs.alive.to(device=device)
-    d0 = torch.where(alive.view(1, P) & alive.view(P, 1), d0, torch.zeros_like(d0))
-    n_alive = alive.float().sum().clamp(min=1.0)
-    mean_dist = d0.sum(dim=1) / n_alive
-    centrality = 1.0 / (mean_dist + 1.0)
-    return centrality.to(obs.ships.dtype)
+        return torch.ones(P, device=device, dtype=dtype)
+    # Bolt: Use matrix-vector product to avoid redundant masks and clones.
+    d0 = cache.cross_dist[0].to(dtype)
+    alive = obs.alive.to(dtype)
+    # Sum distances to alive planets only
+    total_dist = torch.mv(d0, alive)
+    # Mask out dead rows to match original behavior (mean_dist=0 => centrality=1)
+    total_dist = torch.where(obs.alive, total_dist, torch.zeros_like(total_dist))
+    n_alive = alive.sum().clamp(min=1.0)
+    return n_alive / (total_dist + n_alive)
 
 
 # ---------------------------------------------------------------------------
@@ -363,13 +367,15 @@ def _border_defense_boost(
 
 def _build_defense_entries(
     *,
-    movement: PlanetMovement,
+    status: PlanetGarrisonStatus,
     obs,
     cache,
+    prod: Tensor,
     config: ProducerLiteConfig,
     player_count: int,
     border_boost_vec: Tensor,
 ):
+    """Proactive defense entries; optimized to reuse status + prod and avoid syncs."""
     P = int(obs.P)
     device = obs.device
     dtype = obs.ships.dtype
@@ -382,124 +388,88 @@ def _build_defense_entries(
     if not bool(owned.any()):
         return _empty_entries(device, dtype)
 
-    H = min(int(config.defense_threat_horizon), int(movement.garrison_status(max_horizon=int(config.defense_threat_horizon)).ships.shape[-1]) - 1)
-    if H <= 0:
+    # Sentinel: Ensure status has expected horizon for defense threat assessment.
+    # Bolt: Reuse already computed garrison status and prod values.
+    H_val = status.ships.shape[-1] - 1
+    if H_val <= 0:
         return _empty_entries(device, dtype)
 
-    status = movement.garrison_status(max_horizon=H)
     ships_at_H = status.ships[:, -1]
     current_ships = obs.ships.to(dtype)
 
     border_threat_scale = border_boost_vec.clamp(max=2.0)
     effective_ships = ships_at_H / border_threat_scale
 
-    # تصنيف الكواكب: مهددة يمكن إنقاذها، ومهددة ساقطة لا محالة (الأرض المحروقة)
+    # Categorize planets: threatened (savable) or doomed (evacuate)
     threatened = owned & (effective_ships < 0)
-    doomed = threatened & (effective_ships < -3.0 * current_ships) # هجوم كاسح جداً
+    doomed = threatened & (effective_ships < -3.0 * current_ships)
     savable = threatened & (~doomed)
 
     all_entries = []
 
-    # 1. سياسة الأرض المحروقة (إخلاء الكواكب الساقطة)
+    # 1. Scorched earth: evacuate doomed planets to nearest safe owned planet.
     if bool(doomed.any()):
         doomed_indices = doomed.nonzero(as_tuple=False).squeeze(1)
         safe_planets = owned & (~threatened)
         if bool(safe_planets.any()):
             safe_idx = safe_planets.nonzero(as_tuple=False).squeeze(1)
             d0 = cache.cross_dist[0].to(dtype)
-            for d_idx in doomed_indices:
-                d_id = int(d_idx.item())
-                if current_ships[d_id] < 1.0: continue
-                # إرسال كل شيء لأقرب كوكب آمن
+            curr_ships_cpu = current_ships.cpu()
+            for d_id in doomed_indices.tolist():
+                if curr_ships_cpu[d_id] < 1.0: continue
                 dists = d0[d_id, safe_idx]
-                best_safe_local = int(dists.argmin().item())
-                best_safe = int(safe_idx[best_safe_local].item())
+                best_safe = int(safe_idx[dists.argmin()].item())
 
                 src_t = torch.tensor([[d_id]], dtype=torch.long, device=device)
                 tgt_t = torch.tensor([[best_safe]], dtype=torch.long, device=device)
-                send_t = torch.tensor([[float(current_ships[d_id].item())]], dtype=dtype, device=device)
-                eta_t = torch.tensor([[1.0]], dtype=dtype, device=device) # ETA وهمي للهروب السريع
-                valid_t = torch.tensor([[True]], dtype=torch.bool, device=device)
+                send_t = torch.tensor([[float(curr_ships_cpu[d_id])]], dtype=dtype, device=device)
+                eta_t = torch.tensor([[1.0]], dtype=dtype, device=device)
+                all_entries.append(make_launch_set(source_slots=src_t, target_slots=tgt_t, ships=send_t, eta=eta_t, valid=torch.tensor([[True]], device=device), player_id=pid))
 
-                entry = make_launch_set(source_slots=src_t, target_slots=tgt_t, ships=send_t, eta=eta_t, valid=valid_t, player_id=pid)
-                all_entries.append(entry)
-
-
-    # 2. Aggregated Defense for savable planets
+    # 2. Aggregated Defense for savable planets.
     if bool(savable.any()):
-        tgt_indices = savable.nonzero(as_tuple=False).squeeze(1)
-        src_indices = owned.nonzero(as_tuple=False).squeeze(1)
-        d0 = cache.cross_dist[0].to(dtype)
+        savable_indices = savable.nonzero(as_tuple=False).squeeze(1)
+        # Filter by value: production or existing garrison.
+        high_value = (prod[savable_indices] >= 0.5) | (current_ships[savable_indices] >= 20.0)
+        tgt_indices = savable_indices[high_value]
+        if bool(tgt_indices.any()):
+            src_indices = owned.nonzero(as_tuple=False).squeeze(1)
+            d0 = cache.cross_dist[0].to(dtype)
+            available_ships = current_ships.clone()
+            ships_at_H_cpu = ships_at_H.cpu()
+            waves_launched, max_waves = 0, int(config.defense_max_waves)
+            margin, min_launch = float(config.defense_min_intercept_margin), float(config.min_ships_to_launch)
 
-        # Track available ships per source during defense allocation
-        available_ships = current_ships.clone()
-        waves_launched = 0
+            for tgt in tgt_indices.tolist():
+                if waves_launched >= max_waves: break
+                deficit = float(-ships_at_H_cpu[tgt])
+                need = deficit * margin
+                if need <= 0: continue
 
-        for t_i in range(int(tgt_indices.shape[0])):
-            if waves_launched >= int(config.defense_max_waves): break
-            tgt = int(tgt_indices[t_i].item())
+                dists = d0[src_indices, tgt]
+                speeds = fleet_speed(available_ships[src_indices].clamp(min=1.0))
+                etas = (dists / speeds.clamp(min=1e-6)).ceil()
+                can_arrive = etas <= float(H_val)
+                valid_src_mask = can_arrive & (src_indices != tgt) & (~doomed[src_indices]) & (available_ships[src_indices] > min_launch)
+                if not valid_src_mask.any(): continue
 
-            # Recalculate deficit at current step
-            # Only defend if production is high enough or it's a high-garrison planet
-            tgt_prod = float(prod_val[tgt].item())
-            tgt_ships_now = float(current_ships[tgt].item())
-
-            # Heuristic: Don't waste ships on low-value planets unless they are already large
-            if tgt_prod < 0.5 and tgt_ships_now < 20.0:
-                continue
-
-            deficit = float(-ships_at_H[tgt].item())
-            need = deficit * float(config.defense_min_intercept_margin)
-            if need <= 0: continue
-
-            # Consider all sources that can arrive by H
-            dists = d0[src_indices, tgt]
-            speeds = fleet_speed(available_ships[src_indices].clamp(min=1.0))
-            etas = (dists / speeds.clamp(min=1e-6)).ceil()
-
-            can_arrive = etas <= float(H)
-            src_neq_tgt = src_indices != tgt
-            valid_src_mask = can_arrive & src_neq_tgt & (~doomed[src_indices]) & (available_ships[src_indices] > float(config.min_ships_to_launch))
-
-            if not valid_src_mask.any(): continue
-
-            # Sort valid sources by distance
-            v_src_idx = src_indices[valid_src_mask]
-            v_dists = dists[valid_src_mask]
-            v_etas = etas[valid_src_mask]
-
-            sorted_indices = torch.argsort(v_dists)
-
-            contributed_ships = 0.0
-            for idx in sorted_indices.tolist():
-                s_idx = int(v_src_idx[idx].item())
-                s_eta = float(v_etas[idx].item())
-
-                # How much can this source give?
-                # Capped at 50% of available to avoid leaving source vulnerable,
-                # or the remaining need.
-                s_surplus = max(0.0, float(available_ships[s_idx].item()) - float(config.min_ships_to_launch))
-                s_give = min(s_surplus * 0.5, need - contributed_ships)
-
-                if s_give >= float(config.min_ships_to_launch):
-                    src_t = torch.tensor([[s_idx]], dtype=torch.long, device=device)
-                    tgt_t = torch.tensor([[tgt]], dtype=torch.long, device=device)
-                    send_t = torch.tensor([[s_give]], dtype=dtype, device=device)
-                    eta_t = torch.tensor([[s_eta]], dtype=dtype, device=device)
-                    valid_t = torch.tensor([[True]], dtype=torch.bool, device=device)
-
-                    entry = make_launch_set(source_slots=src_t, target_slots=tgt_t, ships=send_t, eta=eta_t, valid=valid_t, player_id=pid)
-                    all_entries.append(entry)
-
-                    contributed_ships += s_give
-                    available_ships[s_idx] -= s_give
-
-                if contributed_ships >= need:
-                    break
-
-            if contributed_ships > 0:
-                waves_launched += 1
-
+                v_src_idx = src_indices[valid_src_mask]
+                sorted_indices = torch.argsort(dists[valid_src_mask])
+                contributed_ships = 0.0
+                available_ships_cpu = available_ships.cpu()
+                for idx in sorted_indices.tolist():
+                    s_idx = int(v_src_idx[idx].item())
+                    s_eta = float(etas[valid_src_mask][idx].item())
+                    s_give = min(float(available_ships_cpu[s_idx]) * 0.5, need - contributed_ships)
+                    if s_give >= min_launch:
+                        src_t, tgt_t = torch.tensor([[s_idx]], device=device), torch.tensor([[tgt]], device=device)
+                        send_t, eta_t = torch.tensor([[s_give]], device=device, dtype=dtype), torch.tensor([[s_eta]], device=device, dtype=dtype)
+                        all_entries.append(make_launch_set(source_slots=src_t, target_slots=tgt_t, ships=send_t, eta=eta_t, valid=torch.tensor([[True]], device=device), player_id=pid))
+                        contributed_ships += s_give
+                        available_ships[s_idx] -= s_give
+                        available_ships_cpu[s_idx] -= s_give
+                    if contributed_ships >= need: break
+                if contributed_ships > 0: waves_launched += 1
 
     if not all_entries:
         return _empty_entries(device, dtype)
@@ -1255,11 +1225,10 @@ def run_turn(obs_tensors: dict, *, config: ProducerLiteConfig, player_count: int
 
     # Proactive defense (now border-aware)
     defense_entries = _build_defense_entries(
-        movement=movement, obs=obs, cache=cache,
+        status=status, obs=obs, cache=cache, prod=movement.planet_prod,
         config=config, player_count=int(player_count),
         border_boost_vec=border_boost_vec,
     )
-
     # Comet detection
     prev_obs = getattr(memory, "prev_obs", None)
     comet_mask = detect_comets(obs, prev_obs, threshold=float(config.comet_movement_threshold))

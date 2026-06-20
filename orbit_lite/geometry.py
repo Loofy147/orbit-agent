@@ -68,8 +68,9 @@ def fleet_speed(ships: Tensor) -> Tensor:
     """
     s = ships.clamp(min=1.0)
     s_lut = s.clamp(max=float(_FLEET_SPEED_LUT_MAX))
-    lo = torch.floor(s_lut).long()
-    hi = torch.ceil(s_lut).long()
+    # Bolt: Faster interpolation indices using casting and manual offset.
+    lo = s_lut.to(torch.long)
+    hi = (lo + 1).clamp(max=_FLEET_SPEED_LUT_MAX)
     frac = s_lut - lo.to(dtype=s.dtype)
 
     lut = _fleet_speed_lut_on(s.device, s.dtype)

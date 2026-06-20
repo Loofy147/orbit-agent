@@ -57,17 +57,21 @@ class LaunchSet:
 
 
 def _per_step_survivor(arrivals: Tensor) -> tuple[Tensor, Tensor]:
-    """Engine survivor over the owner axis for every step.
-
-    ``arrivals`` is ``[..., A]``; returns ``(survivor_owner, survivor_ships)``
-    over the trailing axis, applying the engine rule: survivor ships = top1 -
-    top2, ties annihilate (ships 0). Owner is meaningful only where ships > 0.
-    """
+    """Engine survivor over the owner axis for every step (optimized)."""
     A = int(arrivals.shape[-1])
-    if A >= 2:
+    if A == 2:
+        # Bolt: Optimized 2-player path (most common).
+        s0, s1 = arrivals[..., 0], arrivals[..., 1]
+        diff = s0 - s1
+        survivor_ships = diff.abs()
+        # diff > 0 => owner 0; diff < 0 => owner 1; diff == 0 => tied (0 ships).
+        survivor_owner = (diff < 0).to(torch.long)
+        survivor_ships = torch.where(diff == 0, torch.zeros_like(diff), survivor_ships)
+        return survivor_owner, survivor_ships
+
+    if A > 2:
         top2 = arrivals.topk(k=2, dim=-1)
-        top_ships = top2.values[..., 0]
-        second_ships = top2.values[..., 1]
+        top_ships, second_ships = top2.values[..., 0], top2.values[..., 1]
         top_owner = top2.indices[..., 0].to(dtype=torch.long)
     else:
         top_ships, top_owner = arrivals.max(dim=-1)
