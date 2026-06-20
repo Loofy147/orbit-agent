@@ -631,7 +631,7 @@ def _suppress_late_candidates(
     pid = int(player_id)
     tgt_abs = target_idx[cand_tgt_short].clamp(0, P - 1)
     tgt_owner = obs.owner_abs.to(device=device)[tgt_abs].long()
-    eta = (cand_eta[:, 0] if cand_eta.dim() > 1 else cand_eta).reshape(score.shape).to(device=device, dtype=dtype)
+    eta = cand_eta.reshape(score.shape).to(device=device, dtype=dtype)
 
     is_neutral = tgt_owner < 0
     is_enemy = (tgt_owner >= 0) & (tgt_owner != pid) & (~cand_is_def)
