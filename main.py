@@ -60,7 +60,7 @@ class ProducerLiteConfig:
     max_offensive_targets: int = 12
     max_defensive_targets: int = 6
     max_waves_per_turn: int = 6
-    roi_threshold: float = 1.12
+    roi_threshold: float = 1.25
     min_ships_to_launch: float = 3.0
     reinforce_size_beta: float = 1.8
     reinforce_eta_free: float = 3.0
@@ -73,8 +73,8 @@ class ProducerLiteConfig:
     regroup_pressure_norm: str = "none"
     regroup_time_penalty_weight: float = 1e-3
     # Dynamic scaling
-    min_roi: float = 0.95
-    max_roi: float = 1.40
+    min_roi: float = 1.05
+    max_roi: float = 1.45
     horizon_min: int = 8
     horizon_max: int = 24
     beta_min: float = 1.2
@@ -88,7 +88,7 @@ class ProducerLiteConfig:
     # Production snowball
     prod_rush_steps: int = 120
     prod_rush_top_k: int = 3
-    prod_rush_roi_discount: float = 0.65
+    prod_rush_roi_discount: float = 0.75
     # Comet hunting
     comet_score_multiplier: float = 2.5
     comet_movement_threshold: float = 0.5
@@ -956,7 +956,7 @@ def plan_lite_waves(
             all_score.append(c_score)
 
         else:
-            # Vectorized Multi-source synchronization: group by (target, arrival_turn)
+            # Optimized Vectorized Multi-source synchronization
             multi_c_src = []
             multi_c_send = []
             multi_c_angle = []
@@ -966,18 +966,15 @@ def plan_lite_waves(
             multi_c_tgt_short = []
             multi_c_valid = []
 
-            # We pre-calculate turns for all [S, T] pairs
             turns_st = eta_st.ceil().long()
 
             for t_idx in range(T):
                 target_abs = int(target_idx[t_idx].item())
-                target_floor = floor[t_idx] # [K]
+                target_floor = floor[t_idx]
 
-                eta_t = eta_st[:, t_idx]
                 viable_t = viable_st[:, t_idx]
                 turns_t = turns_st[:, t_idx]
 
-                # Possible turns are those where at least one source arrives
                 possible_turns = torch.unique(turns_t[viable_t])
 
                 for k in possible_turns.tolist():
@@ -1006,7 +1003,7 @@ def plan_lite_waves(
                     src_row[:n_contrib] = source_idx[top_k_indices]
                     send_row[:n_contrib] = ships_k
                     angle_row[:n_contrib] = angle_st[top_k_indices, t_idx]
-                    eta_row[:n_contrib] = eta_t[top_k_indices]
+                    eta_row[:n_contrib] = eta_st[top_k_indices, t_idx]
                     active_row[:n_contrib] = True
 
                     multi_c_src.append(src_row)
@@ -1028,12 +1025,19 @@ def plan_lite_waves(
                 c_tgt_short = torch.tensor(multi_c_tgt_short, dtype=torch.long, device=device)
                 c_valid = torch.tensor(multi_c_valid, dtype=torch.bool, device=device)
 
+                # Batch score all multi-source candidates at once
                 launches = make_launch_set(
-                    source_slots=c_src, target_slots=c_tgt_slot.unsqueeze(-1).expand(-1, L),
-                    ships=c_send, eta=c_eta, valid=c_active & c_valid.unsqueeze(-1), player_id=pid
+                    source_slots=c_src,
+                    target_slots=c_tgt_slot.unsqueeze(-1).expand(-1, L),
+                    ships=c_send,
+                    eta=c_eta,
+                    valid=c_active & c_valid.unsqueeze(-1),
+                    player_id=pid
                 )
-                c_score = score_candidates(garrison_status, prod=prod, alive_by_step=alive_by_step,
-                                           player_count=int(player_count), launches=launches, player_id=pid)
+                c_score = score_candidates(
+                    garrison_status, prod=prod, alive_by_step=alive_by_step,
+                    player_count=int(player_count), launches=launches, player_id=pid
+                )
 
                 all_cand_src.append(c_src)
                 all_cand_tgt_slot.append(c_tgt_slot)
@@ -1045,6 +1049,7 @@ def plan_lite_waves(
                 all_cand_valid.append(c_valid)
                 all_cand_is_def.append(target_is_mine[c_tgt_short])
                 all_score.append(c_score)
+
 
 
     if not all_score:
@@ -1271,7 +1276,7 @@ CONFIG_3P = replace(
     prod_rush_steps=100,
     near_wave_fraction=0.60,
     ring_inner_boost=1.8,
-    size_multipliers=(0.5, 1.0),
+    size_multipliers=(0.7, 1.0),
     max_contributors_per_wave=2,
     reinforce_size_beta=1.5,
 )
@@ -1292,7 +1297,7 @@ CONFIG_4P = replace(
     ring_outer_penalty=0.4,
     knn_sources_per_target=3,
     border_boost=2.0,
-    size_multipliers=(0.33, 0.66, 1.0),
+    size_multipliers=(0.6, 1.0),
     max_contributors_per_wave=3,
     reinforce_size_beta=0.0,
 )
