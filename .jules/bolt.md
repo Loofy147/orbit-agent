@@ -19,3 +19,11 @@
 ## 2025-05-15 - [2-Player Optimized Combat]
 **Learning:** `topk(2)` is relatively expensive for just 2 players.
 **Action:** Implemented a dedicated branch for `A=2` in `_per_step_survivor` using simple subtraction and `abs()`, which is significantly faster for the most common game mode.
+
+## 2025-05-15 - [Sun-Skimming Vectorization]
+**Learning:** Python loops over angular offsets (even small lists like 10) in `intercept_angle` trigger significant host-device synchronization during verify checks.
+**Action:** Vectorized the offset verification by broadcasting offsets over the blocked candidate set, allowing a single `_analytic_first_contact` call to process all permutations in parallel.
+
+## 2025-05-15 - [KNN & Scorched Earth Vectorization]
+**Learning:** Target-wise loops for KNN source selection and scorched earth evacuation add unnecessary Python overhead.
+**Action:** Replaced with vectorized operations using `torch.topk` and `argmin(dim=1)` over the distance matrix, significantly improving planning throughput.

@@ -58,6 +58,8 @@ class LaunchSet:
 
 def _per_step_survivor(arrivals: Tensor) -> tuple[Tensor, Tensor]:
     """Engine survivor over the owner axis for every step (optimized)."""
+    if arrivals is None or arrivals.numel() == 0:
+        return torch.zeros(0, dtype=torch.long), torch.zeros(0)
     A = int(arrivals.shape[-1])
     if A == 2:
         # Bolt: Optimized 2-player path (most common).

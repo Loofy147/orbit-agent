@@ -247,33 +247,36 @@ def _knn_sources_for_targets(
     cache,
     config: ProducerLiteConfig,
 ) -> Tensor:
+    """Vectorized KNN source selection per target (Pulse)."""
     P = int(obs.P)
     device = obs.device
     dtype = obs.ships.dtype
     K = int(config.knn_sources_per_target)
 
     owned_mask = obs.owned & obs.alive & (obs.ships >= float(config.min_ships_to_launch))
-    if not bool(owned_mask.any()) or K <= 0:
+    n_owned = int(owned_mask.sum().item())
+    if n_owned == 0 or K <= 0 or target_idx.numel() == 0:
         return torch.zeros(0, dtype=torch.long, device=device)
 
     d0 = cache.cross_dist[0].to(dtype)  # [P, P]
-    extra = []
-    for t in target_idx.tolist():
-        t = int(t)
-        if t < 0 or t >= P:
-            continue
-        dists = d0[t].clone()
-        dists[~owned_mask] = 1e9
-        dists[t] = 1e9  # can't source from self
-        k = min(K, int(owned_mask.sum().item()))
-        if k <= 0:
-            continue
-        nearest = torch.topk(-dists, k).indices
-        extra.extend(nearest.tolist())
+    tgt_abs = target_idx.clamp(0, P - 1)
 
-    if not extra:
-        return torch.zeros(0, dtype=torch.long, device=device)
-    return torch.tensor(extra, dtype=torch.long, device=device).unique()
+    # [T, P] distances from each target to all planets
+    d_tp = d0[tgt_abs]
+
+    # Mask invalid sources: not owned, or is the target itself
+    invalid_mask = (~owned_mask).view(1, P).expand(tgt_abs.shape[0], P)
+    # Self-source check: target planet cannot be its own source
+    self_mask = torch.eye(P, device=device, dtype=torch.bool)[tgt_abs]
+
+    d_tp = torch.where(invalid_mask | self_mask, torch.tensor(1e9, device=device, dtype=dtype), d_tp)
+
+    k = min(K, n_owned)
+    # Get top-k nearest owned planets for all targets at once
+    nearest = torch.topk(-d_tp, k, dim=1).indices # [T, k]
+
+    # Flatten and return unique source indices
+    return nearest.view(-1).unique()
 
 
 # ---------------------------------------------------------------------------
@@ -407,24 +410,31 @@ def _build_defense_entries(
 
     all_entries = []
 
-    # 1. Scorched earth: evacuate doomed planets to nearest safe owned planet.
+    # 1. Scorched earth: evacuate doomed planets to nearest safe owned planet (Vectorized).
     if bool(doomed.any()):
         doomed_indices = doomed.nonzero(as_tuple=False).squeeze(1)
         safe_planets = owned & (~threatened)
         if bool(safe_planets.any()):
             safe_idx = safe_planets.nonzero(as_tuple=False).squeeze(1)
             d0 = cache.cross_dist[0].to(dtype)
-            curr_ships_cpu = current_ships.cpu()
-            for d_id in doomed_indices.tolist():
-                if curr_ships_cpu[d_id] < 1.0: continue
-                dists = d0[d_id, safe_idx]
-                best_safe = int(safe_idx[dists.argmin()].item())
 
-                src_t = torch.tensor([[d_id]], dtype=torch.long, device=device)
-                tgt_t = torch.tensor([[best_safe]], dtype=torch.long, device=device)
-                send_t = torch.tensor([[float(curr_ships_cpu[d_id])]], dtype=dtype, device=device)
-                eta_t = torch.tensor([[1.0]], dtype=dtype, device=device)
-                all_entries.append(make_launch_set(source_slots=src_t, target_slots=tgt_t, ships=send_t, eta=eta_t, valid=torch.tensor([[True]], device=device), player_id=pid))
+            # Filter doomed indices that have ships to send
+            can_evac = current_ships[doomed_indices] >= 1.0
+            if can_evac.any():
+                evac_indices = doomed_indices[can_evac]
+                # [M_evac, N_safe] distances
+                dists = d0[evac_indices][:, safe_idx]
+                best_safe_local = dists.argmin(dim=1)
+                best_safe_global = safe_idx[best_safe_local]
+
+                M_evac = evac_indices.shape[0]
+                src_t = evac_indices.view(M_evac, 1)
+                tgt_t = best_safe_global.view(M_evac, 1)
+                send_t = current_ships[evac_indices].view(M_evac, 1)
+                eta_t = torch.ones((M_evac, 1), dtype=dtype, device=device)
+                valid_t = torch.ones((M_evac, 1), dtype=torch.bool, device=device)
+
+                all_entries.append(make_launch_set(source_slots=src_t, target_slots=tgt_t, ships=send_t, eta=eta_t, valid=valid_t, player_id=pid))
 
     # 2. Aggregated Defense for savable planets.
     if bool(savable.any()):
@@ -827,8 +837,13 @@ def plan_lite_waves(
         return _empty_entries(device, dtype)
 
 
-    S = int(source_idx.shape[0])
-    T = int(target_idx.shape[0])
+    # Sentinel: Bound source and target counts to prevent DoS from observation bloat.
+    S = min(64, int(source_idx.shape[0]))
+    T = min(64, int(target_idx.shape[0]))
+    if S < int(source_idx.shape[0]): source_idx = source_idx[:S]
+    if T < int(target_idx.shape[0]):
+        target_idx = target_idx[:T]
+        target_exists = target_exists[:T]
     target_is_mine = obs.owned[target_idx.clamp(0, P - 1)]
 
     source_ships = obs.ships[source_idx.clamp(0, P - 1)].to(dtype)
