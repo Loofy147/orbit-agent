@@ -90,7 +90,7 @@ class ProducerLiteConfig:
     prod_rush_top_k: int = 3
     prod_rush_roi_discount: float = 0.80
     # Comet hunting
-    comet_score_multiplier: float = 2.5
+    comet_score_multiplier: float = 2.0
     comet_movement_threshold: float = 0.5
     # ---- NEW: Nearest/Furthest wave split ----
     near_wave_fraction: float = 0.65   # fraction of W waves allocated to nearest targets
@@ -440,6 +440,14 @@ def _build_defense_entries(
             tgt = int(tgt_indices[t_i].item())
 
             # Recalculate deficit at current step
+            # Only defend if production is high enough or it's a high-garrison planet
+            tgt_prod = float(prod_val[tgt].item())
+            tgt_ships_now = float(current_ships[tgt].item())
+
+            # Heuristic: Don't waste ships on low-value planets unless they are already large
+            if tgt_prod < 0.5 and tgt_ships_now < 20.0:
+                continue
+
             deficit = float(-ships_at_H[tgt].item())
             need = deficit * float(config.defense_min_intercept_margin)
             if need <= 0: continue
@@ -1121,6 +1129,18 @@ def plan_lite_waves(
             score = score * align_weight.reshape(score.shape)
 
 
+
+    # ---- NEW: Multi-source vulnerability penalty ----
+    # Multi-source strikes are powerful but leave multiple sources vulnerable.
+    # Apply a penalty based on the number of active contributors.
+    n_active = cand_active.float().sum(dim=1)
+    # Give a small bonus for synchronization to encourage it when it matters,
+    # but also account for cost.
+    # v133: Neutral sync is good, Enemy sync is better.
+    # We'll use a small penalty for multiple sources to avoid over-committing.
+    multi_vulnerability = 1.0 - (n_active - 1) * 0.05
+    score = score * multi_vulnerability.reshape(score.shape)
+
     # Late-game suppression
     score = _suppress_late_candidates(
         score=score, obs=obs, target_idx=target_idx,
@@ -1284,29 +1304,29 @@ CONFIG_3P = replace(
     ProducerLiteConfig(),
     horizon=15,
     max_sources_per_lane=8,
-    max_offensive_targets=10,
+    max_offensive_targets=12,
     max_defensive_targets=5,
-    roi_threshold=1.10,
+    roi_threshold=1.40,
     prod_rush_steps=100,
-    near_wave_fraction=0.60,
+    near_wave_fraction=0.65,
     ring_inner_boost=1.8,
     size_multipliers=(0.7, 1.0),
     max_contributors_per_wave=2,
-    reinforce_size_beta=1.5,
+    reinforce_size_beta=2.2,
 )
 
 CONFIG_4P = replace(
     ProducerLiteConfig(),
     horizon=14,
-    roi_threshold=1.05,
+    roi_threshold=1.45,
     max_sources_per_lane=8,
     max_defensive_targets=4,
-    max_waves_per_turn=6,
+    max_waves_per_turn=5,
     max_regroup_time=5.0,
     max_regroup_targets_per_source=6,
     prod_rush_steps=85,
     geometry_weight=0.40,
-    near_wave_fraction=0.60,
+    near_wave_fraction=0.65,
     ring_inner_boost=1.8,
     ring_outer_penalty=0.4,
     knn_sources_per_target=3,
