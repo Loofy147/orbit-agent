@@ -99,13 +99,15 @@ def min_distance_to_targets(
     K = max(0, min(int(max_k), int(cache.K)))
     if K <= 0:
         return torch.zeros(cache.P, dtype=cache.dtype, device=cache.device)
+    # Clone the cross-k slice so we can ``masked_fill_`` invalid entries to +inf
+    # without touching the cache's storage. The union of the three masks is
+    # equivalent to ``~valid_pair = ~src_mask | ~tgt_mask | ~alive_at_k``.
     cross = cache.cross_dist[1 : K + 1]             # [K, P_src, P_tgt]
     alive_steps = cache.alive_by_step[1 : K + 1]    # [K, P]
     src_mask = source_mask.to(device=cache.device, dtype=torch.bool)
     tgt_mask = target_mask.to(device=cache.device, dtype=torch.bool)
-    # Bolt: Avoid .clone() and multiple .masked_fill_ syncs.
-    # We use a single torch.where with an in-place amin broadcast.
-    valid = alive_steps.unsqueeze(1) & src_mask.view(1, cache.P, 1) & tgt_mask.view(1, 1, cache.P)
+    # Bolt: Avoid  and multiple .masked_fill_ syncs.
+    valid = (alive_steps.unsqueeze(1) & src_mask.view(1, cache.P, 1) & tgt_mask.view(1, 1, cache.P))
     best_per_target = torch.where(valid, cross, torch.tensor(float("inf"), device=cache.device, dtype=cache.dtype)).amin(dim=(0, 1))
     return torch.where(torch.isfinite(best_per_target), best_per_target, torch.zeros_like(best_per_target))
 
