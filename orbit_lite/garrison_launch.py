@@ -57,26 +57,30 @@ class LaunchSet:
 
 
 def _per_step_survivor(arrivals: Tensor) -> tuple[Tensor, Tensor]:
-    """Engine survivor over the owner axis for every step.
-
-    ``arrivals`` is ``[..., A]``; returns ``(survivor_owner, survivor_ships)``
-    over the trailing axis, applying the engine rule: survivor ships = top1 -
-    top2, ties annihilate (ships 0). Owner is meaningful only where ships > 0.
-    """
+    """Engine survivor over the owner axis for every step (optimized)."""
+    if arrivals is None or arrivals.numel() == 0:
+        device = arrivals.device if arrivals is not None else "cpu"
+        return torch.zeros(0, dtype=torch.long, device=device), torch.zeros(0, device=device)
     A = int(arrivals.shape[-1])
-    if A >= 2:
+    if A == 2:
+        # Bolt: Optimized 2-player path (most common).
+        s0, s1 = arrivals[..., 0], arrivals[..., 1]
+        diff = s0 - s1
+        survivor_ships = diff.abs()
+        # diff > 0 => owner 0; diff < 0 => owner 1; diff == 0 => tied (0 ships).
+        survivor_owner = (diff < 0).to(torch.long)
+        survivor_ships = torch.where(diff == 0, torch.zeros_like(diff), survivor_ships)
+        return survivor_owner, survivor_ships
+    if A > 2:
         top2 = arrivals.topk(k=2, dim=-1)
-        top_ships = top2.values[..., 0]
-        second_ships = top2.values[..., 1]
+        top_ships, second_ships = top2.values[..., 0], top2.values[..., 1]
         top_owner = top2.indices[..., 0].to(dtype=torch.long)
     else:
         top_ships, top_owner = arrivals.max(dim=-1)
         second_ships = torch.zeros_like(top_ships)
         top_owner = top_owner.to(dtype=torch.long)
     tied = top_ships == second_ships
-    survivor_ships = torch.where(
-        tied, torch.zeros_like(top_ships), (top_ships - second_ships).clamp(min=0.0)
-    )
+    survivor_ships = torch.where(tied, torch.zeros_like(top_ships), (top_ships - second_ships).clamp(min=0.0))
     return top_owner, survivor_ships
 
 
@@ -315,8 +319,7 @@ def sparse_launch_flow_delta(
     alive_by_step: Tensor,
     player_count: int,
     launches: LaunchSet,
-    player_id: int = 0,
-) -> GarrisonFlowDiff:
+    player_id: int = 0, baseline: tuple[Tensor, Tensor] | None = None) -> GarrisonFlowDiff:
     """Sparse equivalent of ``diff_garrison_flow(status, apply_launches_exact(...))``.
 
     Returns the **same** exact per-candidate, per-player flow diff as the dense
@@ -360,15 +363,15 @@ def sparse_launch_flow_delta(
     affected.scatter_add_(1, tgt_safe, valid_t.to(fdtype))
     affected_mask = affected > 0
 
-    # Baseline per-planet flow (shared across candidates).
-    base_prod_pp, base_combat_pp = _flow_terms_per_planet(
-        owner=status.owner,
-        pre_owner=status.pre_combat_owner,
-        pre_ships=status.pre_combat_ships,
-        arr_full=status.arrivals_by_owner,
-        prod=prod,
-        alive_pmajor=alive_by_step.permute(1, 0),
-    )                                                        # [P, A]
+    # Pulse: Reuse baseline if provided to avoid redundant O(P*H*A) work.
+    if baseline is not None:
+        base_prod_pp, base_combat_pp = baseline
+    else:
+        base_prod_pp, base_combat_pp = _flow_terms_per_planet(
+            owner=status.owner, pre_owner=status.pre_combat_owner,
+            pre_ships=status.pre_combat_ships, arr_full=status.arrivals_by_owner,
+            prod=prod, alive_pmajor=alive_by_step.permute(1, 0),
+        )
     base_prod = base_prod_pp.sum(dim=0)                      # [A]
     base_combat = base_combat_pp.sum(dim=0)
 
@@ -448,3 +451,6 @@ def sparse_launch_flow_delta(
             net_ship_delta=_sq(diff.net_ship_delta),
         )
     return diff
+
+def precompute_flow_baseline(status, prod, alive_by_step):
+    return _flow_terms_per_planet(owner=status.owner, pre_owner=status.pre_combat_owner, pre_ships=status.pre_combat_ships, arr_full=status.arrivals_by_owner, prod=prod, alive_pmajor=alive_by_step.permute(1, 0))

@@ -42,7 +42,7 @@ def largest_initial_player_count(obs_tensors: dict) -> int:
     owners = owner[mask]
     n_max = 2
     if owners.numel() > 0:
-        n_max = max(n_max, int(torch.unique(owners.long()).numel()))
+        n_max = min(4, max(n_max, int(torch.unique(owners.long()).numel())))
     return n_max
 
 
@@ -93,8 +93,7 @@ def score_candidates(
     alive_by_step: Tensor,
     player_count: int,
     launches: LaunchSet,
-    player_id: int,
-) -> Tensor:
+    player_id: int, baseline: tuple[Tensor, Tensor] | None = None) -> Tensor:
     """Competitive score per candidate. ``[C]`` (or scalar if no candidate axis).
 
     Uses the sparse exact flow projector.
@@ -105,8 +104,7 @@ def score_candidates(
         alive_by_step=alive_by_step,
         player_count=int(player_count),
         launches=launches,
-        player_id=int(player_id),
-    )
+        player_id=int(player_id), baseline=baseline)
     return competitive_score(diff, player_id=int(player_id))
 
 

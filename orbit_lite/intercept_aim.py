@@ -146,48 +146,32 @@ def intercept_angle(
         eta_c[midx] = torch.where(keep, eta_cm, torch.full_like(eta_cm, float(H)))
 
 
-    # ---- NEW: Sun-Skimming Trajectories ----
-    # If a direct path is blocked by the sun, try grazing it with small angular offsets.
-    # Note: contact == -1 AND eta_c < H usually implies an environment death (Sun or OOB).
-    # Since we aimed at the target, eta_c < H and contact != tgt means we hit something else.
-    # If point-to-segment distance to sun is small, it's a sun hit.
-
+    # ---- Pulse: Vectorized Sun-Skimming Verification ----
     viable = (contact == tgt)
-    blocked = ~viable
-    if blocked.any():
-        # Identify sun-blocked candidates: contact == -1 and eta_c < H
-        sun_blocked = blocked & (contact == -1) & (eta_c < H)
-        if sun_blocked.any():
-            sb_idx = sun_blocked.nonzero(as_tuple=False).squeeze(1)
-            # Try offsets: +/- 0.05, 0.1, 0.2, 0.3, 0.4 radians
-            offsets = [0.05, -0.05, 0.1, -0.1, 0.2, -0.2, 0.3, -0.3, 0.4, -0.4]
-
-            for off in offsets:
-                if not sun_blocked.any(): break
-
-                off_angle = angle[sun_blocked] + off
-                off_cos = torch.cos(off_angle)
-                off_sin = torch.sin(off_angle)
-                off_lx = sx[sun_blocked] + off_cos * (src_r[sun_blocked] + LAUNCH_SURFACE_OFFSET)
-                off_ly = sy[sun_blocked] + off_sin * (src_r[sun_blocked] + LAUNCH_SURFACE_OFFSET)
-
-                # Re-verify only for the still-blocked set
-                c_m, e_m = _analytic_first_contact(
-                    launch_x=off_lx, launch_y=off_ly, cos_a=off_cos, sin_a=off_sin,
-                    speed=speed[sun_blocked], px=px, py=py, p_alive0=alive0,
-                    radii=radii_p, H=H, seg_len=seg_len[sun_blocked],
-                )
-
-                success = (c_m == tgt[sun_blocked])
-                if success.any():
-                    # Update winners
-                    s_indices = sb_idx[success]
-                    angle[s_indices] = off_angle[success]
-                    contact[s_indices] = c_m[success]
-                    eta_c[s_indices] = e_m[success]
-                    viable[s_indices] = True
-                    # Update the remaining sun_blocked mask for this loop
-                    sun_blocked[s_indices] = False
+    sun_blocked = (~viable) & (contact == -1) & (eta_c < H)
+    if sun_blocked.any():
+        sb_idx = sun_blocked.nonzero(as_tuple=False).squeeze(1)
+        offsets = torch.tensor([0.05, -0.05, 0.1, -0.1, 0.2, -0.2, 0.3, -0.3, 0.4, -0.4], device=dev, dtype=dt)
+        M_sb, O = sb_idx.shape[0], offsets.shape[0]
+        off_angle = angle[sb_idx].view(M_sb, 1) + offsets.view(1, O)
+        off_cos, off_sin = torch.cos(off_angle), torch.sin(off_angle)
+        off_lx = sx[sb_idx].view(M_sb, 1) + off_cos * (src_r[sb_idx].view(M_sb, 1) + LAUNCH_SURFACE_OFFSET)
+        off_ly = sy[sb_idx].view(M_sb, 1) + off_sin * (src_r[sb_idx].view(M_sb, 1) + LAUNCH_SURFACE_OFFSET)
+        c_m, e_m = _analytic_first_contact(
+            launch_x=off_lx.reshape(-1), launch_y=off_ly.reshape(-1),
+            cos_a=off_cos.reshape(-1), sin_a=off_sin.reshape(-1),
+            speed=speed[sb_idx].repeat_interleave(O), px=px, py=py, p_alive0=alive0,
+            radii=radii_p, H=H, seg_len=seg_len[sb_idx].repeat_interleave(O),
+        )
+        success = (c_m == tgt[sb_idx].repeat_interleave(O)).reshape(M_sb, O)
+        if success.any():
+            has_success = success.any(dim=1)
+            first_success_off = success.to(torch.int8).argmax(dim=1)
+            s_cand_idx = sb_idx[has_success]
+            s_off_idx = first_success_off[has_success]
+            angle[s_cand_idx] = off_angle[has_success].gather(1, s_off_idx.unsqueeze(1)).squeeze(1)
+            contact[s_cand_idx] = tgt[s_cand_idx]
+            eta_c[s_cand_idx] = e_m.reshape(M_sb, O)[has_success].gather(1, s_off_idx.unsqueeze(1)).squeeze(1)
 
     viable = contact == tgt                                           # [M]
     eta_out = torch.where(viable, eta_c.to(dt), torch.full_like(eta_c.to(dt), float("inf")))
