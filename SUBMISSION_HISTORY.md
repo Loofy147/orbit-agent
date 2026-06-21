@@ -2,6 +2,7 @@
 
 | Ref | Date | Score | Description | Status |
 |-----|------|-------|-------------|--------|
+| 53915261 | 2026-06-21 13:48:19.863000 | nan | Hybrid Dominant Agent v131: Restored Safety and ROI with Multi-Source Synchronization | SubmissionStatus.PENDING |
 | 53882607 | 2026-06-20 12:59:26.353000 | 942.9 | Dominant Agent v130: Balanced Hyperparameters, Refined Multi-Size Strategy, and Optimized Synchronized Multi-Source Waves. | SubmissionStatus.COMPLETE |
 | 53861922 | 2026-06-19 22:45:19.273000 | 1046.8 | Dominant Agent v129: Synchronized Multi-Source Waves, Sun-Skimming, and Aggregated Aggressive Defense. | SubmissionStatus.COMPLETE |
 | 53860097 | 2026-06-19 20:35:49.630000 | 1138.0 | Optimized Merged Agent v128: Merged strategies from meta-snapshot, i-the-orbit, and border-defense including Ring Conquest, Production Rush, and adaptive distance scaling. | SubmissionStatus.COMPLETE |
