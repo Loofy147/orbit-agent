@@ -90,7 +90,7 @@ class ProducerLiteConfig:
     # Production snowball
     prod_rush_steps: int = 120
     prod_rush_top_k: int = 3
-    prod_rush_roi_discount: float = 0.80
+    prod_rush_roi_discount: float = 0.60
     # Comet hunting
     comet_score_multiplier: float = 2.0
     comet_movement_threshold: float = 0.5
@@ -709,6 +709,37 @@ def _split_near_far_indices(
 # Core planner – now with all spatial improvements
 # ---------------------------------------------------------------------------
 
+
+
+def _local_cluster_density(
+    *,
+    obs,
+    cache,
+    prod: Tensor,
+) -> Tensor:
+    """Calculates local production density for each planet.
+    favors planets surrounded by high-production neighbors.
+    """
+    P = int(obs.P)
+    device = obs.device
+    dtype = obs.ships.dtype
+    if P <= 1:
+        return torch.ones(P, dtype=dtype, device=device)
+
+    # Use inverse distance weighting for neighborhood production
+    d0 = cache.cross_dist[0].to(dtype).clamp(min=1.0)
+    kernel = 1.0 / (d0 ** 2)
+    # Zero out diagonal
+    kernel.fill_diagonal_(0.0)
+
+    # Production density: sum of neighbors' production weighted by distance
+    neighbor_prod = (kernel @ prod.to(dtype).unsqueeze(1)).squeeze(1)
+    # Normalize by the mean density to get a relative boost factor
+    avg_density = neighbor_prod.mean().clamp(min=1e-6)
+    density_boost = neighbor_prod / avg_density
+
+    # Sigmoid squash to keep it in a reasonable range [0.8, 1.5]
+    return 0.5 + 2.5 * torch.sigmoid(2.0 * (density_boost - 1.0))
 def plan_lite_waves(
     *,
     movement: PlanetMovement,
@@ -722,6 +753,7 @@ def plan_lite_waves(
     player_count: int,
     memory,
     border_boost_vec: Tensor,
+    density_vec: Tensor,
     available_budget: Tensor | None = None,
 ):
     P = obs.P
@@ -997,6 +1029,10 @@ def plan_lite_waves(
     committed_mult = _committed_fleet_penalty_mask(
         obs=obs, target_idx=target_idx, memory=memory, config=config,
     )
+
+
+    # ---- NEW: Local Cluster Density Boost ----
+    score = score * density_vec[target_idx[cand_tgt_short]].reshape(score.shape)
     score = score * committed_mult[cand_tgt_short].reshape(score.shape)
 
     # ---- Strategic alignment (cosine similarity toward enemy centre) ----
@@ -1142,6 +1178,7 @@ def run_turn(obs_tensors: dict, *, config: ProducerLiteConfig, player_count: int
 
     # ---- NEW: Compute border boost once, share across defense + offense ----
     border_boost_vec = _border_defense_boost(obs=obs, cache=cache, config=config)
+    density_vec = _local_cluster_density(obs=obs, cache=cache, prod=movement.planet_prod)
 
     # Proactive defense (now border-aware)
     defense_entries, remaining_budget = _build_defense_entries(
@@ -1163,6 +1200,7 @@ def run_turn(obs_tensors: dict, *, config: ProducerLiteConfig, player_count: int
         alive_by_step=alive_by_step, config=config, player_count=int(player_count),
         memory=memory,
         border_boost_vec=border_boost_vec,
+        density_vec=density_vec,
         available_budget=remaining_budget,
     )
 
@@ -1187,6 +1225,9 @@ def run_turn(obs_tensors: dict, *, config: ProducerLiteConfig, player_count: int
 
 CONFIG_2P = replace(
     ProducerLiteConfig(),
+    roi_threshold=1.10,
+    max_offensive_targets=16,
+    max_waves_per_turn=8,
     size_multipliers=(1.0,),
     max_contributors_per_wave=1,
 )
@@ -1195,12 +1236,13 @@ CONFIG_3P = replace(
     ProducerLiteConfig(),
     horizon=15,
     max_sources_per_lane=8,
-    max_offensive_targets=10,
+    max_offensive_targets=16,
     max_defensive_targets=5,
-    roi_threshold=1.30,
+    max_waves_per_turn=8,
+    roi_threshold=1.10,
     prod_rush_steps=100,
     near_wave_fraction=0.60,
-    ring_inner_boost=1.5,
+    ring_inner_boost=3.0,
     size_multipliers=(0.7, 1.0),
     max_contributors_per_wave=2,
     reinforce_size_beta=2.2,
@@ -1209,16 +1251,17 @@ CONFIG_3P = replace(
 CONFIG_4P = replace(
     ProducerLiteConfig(),
     horizon=13,
-    roi_threshold=1.20,
+    roi_threshold=1.10,
     max_sources_per_lane=7,
+    max_offensive_targets=16,
     max_defensive_targets=4,
-    max_waves_per_turn=5,
+    max_waves_per_turn=8,
     max_regroup_time=6.0,
     max_regroup_targets_per_source=8,
     prod_rush_steps=80,
     geometry_weight=0.45,
     near_wave_fraction=0.55,
-    ring_inner_boost=1.5,
+    ring_inner_boost=3.0,
     ring_outer_penalty=0.5,
     knn_sources_per_target=2,
     border_boost=1.8,
