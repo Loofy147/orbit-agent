@@ -753,9 +753,6 @@ def plan_lite_waves(
     source_idx = torch.topk(source_score, min(S_cap, int(source_score.numel())), dim=0).indices
     source_exists = source_mask[source_idx]
 
-    flow_baseline = precompute_flow_baseline(garrison_status, movement.planet_prod, alive_by_step)
-    flow_baseline = precompute_flow_baseline(garrison_status, prod=movement.planet_prod, alive_by_step=alive_by_step)
-
     flow_baseline = precompute_flow_baseline(garrison_status, prod=movement.planet_prod, alive_by_step=alive_by_step)
     # Build target shortlist
     target_idx, target_exists = build_target_shortlist(
@@ -1200,10 +1197,10 @@ CONFIG_3P = replace(
     max_sources_per_lane=8,
     max_offensive_targets=10,
     max_defensive_targets=5,
-    roi_threshold=1.10,
+    roi_threshold=1.30,
     prod_rush_steps=100,
     near_wave_fraction=0.60,
-    ring_inner_boost=1.8,
+    ring_inner_boost=1.5,
     size_multipliers=(0.7, 1.0),
     max_contributors_per_wave=2,
     reinforce_size_beta=2.2,
@@ -1211,20 +1208,20 @@ CONFIG_3P = replace(
 
 CONFIG_4P = replace(
     ProducerLiteConfig(),
-    horizon=14,
-    roi_threshold=1.05,
-    max_sources_per_lane=8,
+    horizon=13,
+    roi_threshold=1.20,
+    max_sources_per_lane=7,
     max_defensive_targets=4,
-    max_waves_per_turn=6,
-    max_regroup_time=5.0,
-    max_regroup_targets_per_source=6,
-    prod_rush_steps=85,
-    geometry_weight=0.40,
-    near_wave_fraction=0.60,
-    ring_inner_boost=1.8,
-    ring_outer_penalty=0.4,
-    knn_sources_per_target=3,
-    border_boost=2.0,
+    max_waves_per_turn=5,
+    max_regroup_time=6.0,
+    max_regroup_targets_per_source=8,
+    prod_rush_steps=80,
+    geometry_weight=0.45,
+    near_wave_fraction=0.55,
+    ring_inner_boost=1.5,
+    ring_outer_penalty=0.5,
+    knn_sources_per_target=2,
+    border_boost=1.8,
     size_multipliers=(0.6, 1.0),
     max_contributors_per_wave=3,
     reinforce_size_beta=2.2,
