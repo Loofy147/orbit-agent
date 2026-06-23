@@ -364,6 +364,7 @@ def _build_defense_entries(
     config: ProducerLiteConfig,
     player_count: int,
     border_boost_vec: Tensor,
+    intel_def: Tensor,
 ):
     """Proactive defense entries; optimized to reuse status + prod and avoid syncs."""
     P = int(obs.P)
@@ -378,7 +379,7 @@ def _build_defense_entries(
     ships_at_H = status.ships[:, -1]
     current_ships = obs.ships.to(dtype)
     border_threat_scale = border_boost_vec.clamp(max=2.0)
-    effective_ships = ships_at_H / border_threat_scale
+    effective_ships = (ships_at_H / border_threat_scale) * intel_def
     threatened = owned & (effective_ships < 0)
     doomed = threatened & (effective_ships < -3.0 * current_ships)
     savable = threatened & (~doomed)
@@ -740,6 +741,50 @@ def _local_cluster_density(
 
     # Sigmoid squash to keep it in a reasonable range [0.8, 1.5]
     return 0.5 + 2.5 * torch.sigmoid(2.0 * (density_boost - 1.0))
+
+
+def _cluster_dominance_intelligence(
+    *,
+    obs,
+    cache,
+    prod: Tensor,
+    player_id: int,
+) -> dict:
+    """Calculates per-planet dominance intelligence.
+    Returns:
+        off_boost: Boost for offensive targets (favoring low dominance but high potential clusters)
+        def_boost: Boost for defensive targets (favoring high dominance cluster protection)
+    """
+    P = int(obs.P)
+    device = obs.device
+    dtype = obs.ships.dtype
+    if P <= 1:
+        return {'off': torch.ones(P, dtype=dtype, device=device), 'def': torch.ones(P, dtype=dtype, device=device)}
+
+    pid = int(player_id)
+    owned = obs.owned & obs.alive
+    enemy = obs.alive & (obs.owner_abs >= 0) & (obs.owner_abs != pid)
+
+    d0 = cache.cross_dist[0].to(dtype).clamp(min=1.0)
+    kernel = 1.0 / (d0 ** 2)
+    kernel.fill_diagonal_(0.0)
+
+    # total_cluster_prod: [P]
+    total_cluster_prod = (kernel @ prod.to(dtype).unsqueeze(1)).squeeze(1)
+    # owned_cluster_prod: [P]
+    owned_cluster_prod = (kernel @ (prod.to(dtype) * owned.to(dtype)).unsqueeze(1)).squeeze(1)
+
+    dominance = owned_cluster_prod / (total_cluster_prod + 1e-6)
+
+    # Offensive Intelligence: Target areas where we have LOW dominance but there is HIGH total production
+    # Range [1.0, 2.5]
+    off_boost = 1.0 + 1.5 * (1.0 - dominance) * torch.sigmoid(total_cluster_prod / total_cluster_prod.mean().clamp(min=1e-6) - 1.0)
+
+    # Defensive Intelligence: Prioritize areas where we have HIGH dominance (protecting the core)
+    # Range [1.0, 2.0]
+    def_boost = 1.0 + 1.0 * dominance
+
+    return {'off': off_boost, 'def': def_boost}
 def plan_lite_waves(
     *,
     movement: PlanetMovement,
@@ -753,7 +798,7 @@ def plan_lite_waves(
     player_count: int,
     memory,
     border_boost_vec: Tensor,
-    density_vec: Tensor,
+    intel_off: Tensor,
     available_budget: Tensor | None = None,
 ):
     P = obs.P
@@ -1032,7 +1077,16 @@ def plan_lite_waves(
 
 
     # ---- NEW: Local Cluster Density Boost ----
-    score = score * density_vec[target_idx[cand_tgt_short]].reshape(score.shape)
+    score = score * intel_off[target_idx[cand_tgt_short]].reshape(score.shape)
+
+    # ---- NEW: Enemy Density Weighting (Denial Value) ----
+    enemy_mask = obs.alive & (obs.owner_abs >= 0) & (obs.owner_abs != pid)
+    if enemy_mask.any():
+        d0 = cache.cross_dist[0].to(dtype).clamp(min=1.0)
+        kernel = 1.0 / (d0 ** 2)
+        enemy_nearby_prod = (kernel @ (prod.to(dtype) * enemy_mask.to(dtype)).unsqueeze(1)).squeeze(1)
+        denial_boost = 1.0 + 0.5 * torch.sigmoid(enemy_nearby_prod / enemy_nearby_prod.mean().clamp(min=1e-6) - 1.0)
+        score = score * denial_boost[target_idx[cand_tgt_short]].reshape(score.shape)
     score = score * committed_mult[cand_tgt_short].reshape(score.shape)
 
     # ---- Strategic alignment (cosine similarity toward enemy centre) ----
@@ -1064,7 +1118,7 @@ def plan_lite_waves(
     # but also account for cost.
     # v133: Neutral sync is good, Enemy sync is better.
     # We'll use a small penalty for multiple sources to avoid over-committing.
-    multi_vulnerability = 1.0 - (n_active - 1) * 0.05
+    multi_vulnerability = 1.0 - (n_active - 1) * 0.10
     score = score * multi_vulnerability.reshape(score.shape)
 
     # Late-game suppression
@@ -1178,13 +1232,14 @@ def run_turn(obs_tensors: dict, *, config: ProducerLiteConfig, player_count: int
 
     # ---- NEW: Compute border boost once, share across defense + offense ----
     border_boost_vec = _border_defense_boost(obs=obs, cache=cache, config=config)
-    density_vec = _local_cluster_density(obs=obs, cache=cache, prod=movement.planet_prod)
+    intel = _cluster_dominance_intelligence(obs=obs, cache=cache, prod=movement.planet_prod, player_id=int(obs.player_id))
 
     # Proactive defense (now border-aware)
     defense_entries, remaining_budget = _build_defense_entries(
         status=status, obs=obs, cache=cache, prod=movement.planet_prod,
         config=config, player_count=int(player_count),
         border_boost_vec=border_boost_vec,
+        intel_def=intel["def"],
     )
 
     # Comet detection
@@ -1200,7 +1255,7 @@ def run_turn(obs_tensors: dict, *, config: ProducerLiteConfig, player_count: int
         alive_by_step=alive_by_step, config=config, player_count=int(player_count),
         memory=memory,
         border_boost_vec=border_boost_vec,
-        density_vec=density_vec,
+        intel_off=intel["off"],
         available_budget=remaining_budget,
     )
 
@@ -1236,13 +1291,13 @@ CONFIG_3P = replace(
     ProducerLiteConfig(),
     horizon=15,
     max_sources_per_lane=8,
-    max_offensive_targets=16,
+    max_offensive_targets=12,
     max_defensive_targets=5,
-    max_waves_per_turn=8,
-    roi_threshold=1.10,
+    max_waves_per_turn=6,
+    roi_threshold=1.30,
     prod_rush_steps=100,
     near_wave_fraction=0.60,
-    ring_inner_boost=3.0,
+    ring_inner_boost=2.0,
     size_multipliers=(0.7, 1.0),
     max_contributors_per_wave=2,
     reinforce_size_beta=2.2,
@@ -1251,17 +1306,17 @@ CONFIG_3P = replace(
 CONFIG_4P = replace(
     ProducerLiteConfig(),
     horizon=13,
-    roi_threshold=1.10,
+    roi_threshold=1.25,
     max_sources_per_lane=7,
-    max_offensive_targets=16,
+    max_offensive_targets=12,
     max_defensive_targets=4,
-    max_waves_per_turn=8,
+    max_waves_per_turn=6,
     max_regroup_time=6.0,
     max_regroup_targets_per_source=8,
     prod_rush_steps=80,
     geometry_weight=0.45,
     near_wave_fraction=0.55,
-    ring_inner_boost=3.0,
+    ring_inner_boost=2.0,
     ring_outer_penalty=0.5,
     knn_sources_per_target=2,
     border_boost=1.8,
